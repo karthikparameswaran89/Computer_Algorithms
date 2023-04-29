@@ -1,26 +1,17 @@
-import org.apache.spark.sql.{DataFrame, functions => F}
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.functions._
 
-def splitArray(df: DataFrame, n: Int): Array[Array[(Int, Int)]] = {
-  val window = org.apache.spark.sql.expressions.Window.orderBy(F.col("value").desc)
-  val subarrays = Array.fill(n)(Array.empty[(Int, Int)])
-  val subarraySums = Array.fill(n)(0)
-  val result = df
-    .withColumn("row_number", F.row_number().over(window))
-    .repartition(n)
-    .sortWithinPartitions("row_number")
-    .rdd
-    .map(row => (row.getInt(0), row.getInt(1)))
-    .collect()
-    .foldLeft(subarrays) { case (subs, (value, id)) =>
-      val (minIdx, minSum) = subarraySums.zipWithIndex.minBy(_._1)
-      subarraySums(minIdx) += value
-      subs.updated(minIdx, subs(minIdx) :+ (value, id))
-    }
-  result
+def splitArray(df: DataFrame, n: Int): Array[Array[Int]] = {
+  val arr = df.select(col("value").cast("Int")).as[Int].collect()
+  val sortedArr = arr.sorted.reverse
+  val subarrays = Array.fill(n)(Array.empty[Int])
+  for (x <- sortedArr) {
+    val idx = subarrays.zipWithIndex.minBy { case (subarray, _) => subarray.sum }._2
+    subarrays(idx) :+= x
+  }
+  subarrays
 }
 
-val arr = Array((1, "A"), (3, "B"), (4, "C"), (8, "D"), (10, "E"), (12, "F"), (15, "G"))
-val n = 3
-val df = arr.toSeq.toDF("value", "id")
-val subarrays = splitArray(df, n)
-println(subarrays.map(_.map{case (v, i) => s"($v, $i)"}.mkString(", ")).mkString("\n"))
+val input = Seq(("a", "5"), ("b", "3"), ("c", "8"), ("d", "1"), ("e", "2"), ("f", "6"), ("g", "7"), ("h", "4")).toDF("id", "value")
+val subarrays = splitArray(input, 3)
+println(subarrays.map(_.mkString(", ")).mkString("\n"))
