@@ -1,17 +1,19 @@
+import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions._
 
 def splitArray(df: DataFrame, n: Int): Array[Array[Int]] = {
-  val arr = df.select("value").rdd.map(r => r(0).asInstanceOf[Int]).collect().sorted.reverse
+  val arr = df.select("value").as[Int].collect()
+  val sortedArr = arr.sorted.reverse
   val subarrays = Array.fill(n)(Array.empty[Int])
-  for (x <- arr) {
-    val idx = subarrays.zipWithIndex.minBy { case (subarray, _) => subarray.reduce(_ + _) }._2
-    subarrays(idx) = subarrays(idx) :+ x
+  for (x <- sortedArr) {
+    val idx = subarrays.zipWithIndex.minBy { case (subarray, _) => subarray.sum }._2
+    subarrays(idx) :+= x
   }
   subarrays
 }
 
-
-val arr = Seq(11, 20, 2, 4, 8, 13, 16, 0, 1, 0, 3, 6)
-val df = arr.toDF("value")
-val subarrays = splitArray(df, 4)
-subarrays.foreach(subarray => println(subarray.mkString("[", ", ", "]")))
+val arr = Array.range(1, 100)
+val n = 4
+val df = arr.toSeq.toDF("value")
+val subarrays = splitArray(df, n)
+println(subarrays.map(_.mkString(", ")).mkString("\n"))
