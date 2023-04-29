@@ -1,13 +1,31 @@
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.PriorityQueue
 
-object SplitArray {
-  def splitArray(arr: Array[Int], n: Int): Array[Array[Int]] = {
-    val sortedArr = arr.sorted.reverse
-    val subarrays = Array.fill(n)(ArrayBuffer.empty[Int])
-    for (x <- sortedArr) {
-      val idx = subarrays.zipWithIndex.minBy { case (subarray, _) => subarray.sum }._2
-      subarrays(idx) += x
-    }
-    subarrays.map(_.toArray).reverse
+def splitArray(arr: Array[Int], n: Int): Array[Array[Int]] = {
+  // Sort the array in descending order
+  val sortedArr = arr.sorted.reverse
+
+  // Initialize the subarrays with empty arrays
+  val subarrays = Array.fill(n)(Array[Int]())
+
+  // Use a priority queue to keep track of the subarrays
+  val queue = PriorityQueue[(Int, Int)]()(Ordering.by(_._1))
+
+  // Initialize the queue with the indices of the subarrays
+  for (i <- 0 until n) {
+    queue.enqueue((0, i))
   }
+
+  // Iterate over the sorted array and assign each element to the subarray with the smallest sum
+  for (x <- sortedArr) {
+    // Get the index of the subarray with the smallest sum
+    val (_, idx) = queue.dequeue()
+
+    // Add the element to the subarray
+    subarrays(idx) = subarrays(idx) :+ x
+
+    // Update the sum of the subarray in the queue
+    queue.enqueue((subarrays(idx).sum, idx))
+  }
+
+  subarrays
 }
