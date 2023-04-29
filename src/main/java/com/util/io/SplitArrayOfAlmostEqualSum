@@ -1,31 +1,19 @@
-import scala.collection.mutable.PriorityQueue
+import org.apache.spark.sql.functions.{col, when, min, sum}
+import org.apache.spark.sql.DataFrame
 
-def splitArray(arr: Array[Int], n: Int): Array[Array[Int]] = {
-  // Sort the array in descending order
-  val sortedArr = arr.sorted.reverse
-
-  // Initialize the subarrays with empty arrays
-  val subarrays = Array.fill(n)(Array[Int]())
-
-  // Use a priority queue to keep track of the subarrays
-  val queue = PriorityQueue[(Int, Int)]()(Ordering.by(_._1))
-
-  // Initialize the queue with the indices of the subarrays
-  for (i <- 0 until n) {
-    queue.enqueue((0, i))
+def splitArray(df: DataFrame, n: Int): Array[Array[Int]] = {
+  val sortedDf = df.sort(col("value").desc)
+  val subarrays = Array.fill(n)(Array.empty[Int])
+  sortedDf.select(col("value")).collect().foreach { row =>
+    val (idx, _) = subarrays.zipWithIndex.map { case (subarray, idx) =>
+      (sum(subarray), idx)
+    }.reduceLeft((a, b) => if (a._1 < b._1) a else b)
+    subarrays(idx) :+= row.getInt(0)
   }
-
-  // Iterate over the sorted array and assign each element to the subarray with the smallest sum
-  for (x <- sortedArr) {
-    // Get the index of the subarray with the smallest sum
-    val (_, idx) = queue.dequeue()
-
-    // Add the element to the subarray
-    subarrays(idx) = subarrays(idx) :+ x
-
-    // Update the sum of the subarray in the queue
-    queue.enqueue((subarrays(idx).sum, idx))
-  }
-
   subarrays
 }
+
+val arr = Seq(11, 20, 2, 4, 8, 13, 16, 0, 1, 0, 3, 6)
+val df = arr.toDF("value")
+val subarrays = splitArray(df, 4)
+subarrays.foreach(subarray => println(subarray.mkString("[", ", ", "]")))
