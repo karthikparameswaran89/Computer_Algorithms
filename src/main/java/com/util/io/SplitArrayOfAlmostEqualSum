@@ -1,9 +1,13 @@
-def splitArray(arr: List[Int], n: Int): List[List[Int]] = {
-  val sortedArr = arr.sorted.reverse
-  val subarrays = Array.fill[List[Int]](n)(List.empty)
-  sortedArr.foreach { x =>
-    val idx = subarrays.zipWithIndex.minBy(_._1.sum)._2
-    subarrays(idx) ::= x
+import scala.collection.mutable.ArrayBuffer
+
+object SplitArray {
+  def splitArray(arr: Array[Int], n: Int): Array[Array[Int]] = {
+    val sortedArr = arr.sorted.reverse
+    val subarrays = Array.fill(n)(ArrayBuffer.empty[Int])
+    for (x <- sortedArr) {
+      val idx = subarrays.zipWithIndex.minBy { case (subarray, _) => subarray.sum }._2
+      subarrays(idx) += x
+    }
+    subarrays.map(_.toArray).reverse
   }
-  subarrays.toList
 }
