@@ -1,43 +1,9 @@
-import scala.annotation.tailrec
-
-object Main {
-  def main(args: Array[String]): Unit = {
-    val arr = Array(11, 20, 2, 4, 8, 13, 16, 0, 1, 0, 3, 6)
-    val n = 4
-    
-    val subarrays = splitArray(arr.sorted.reverse, n)
-    subarrays.foreach(subarray => println(subarray.toList))
+def splitArray(arr: List[Int], n: Int): List[List[Int]] = {
+  val sortedArr = arr.sorted.reverse
+  val subarrays = Array.fill[List[Int]](n)(List.empty)
+  sortedArr.foreach { x =>
+    val idx = subarrays.zipWithIndex.minBy(_._1.sum)._2
+    subarrays(idx) ::= x
   }
-  
-  def splitArray(arr: Array[Int], n: Int): Array[Array[Int]] = {
-    require(arr.length >= n, "Cannot split array into more subarrays than its length")
-    
-    val subarrays = Array.fill(n)(Array.emptyIntArray)
-    var idx = 0
-    
-    @tailrec
-    def splitRecursive(i: Int, sums: Array[Int]): Unit = {
-      if (i == arr.length) return
-      
-      var j = 0
-      var minDiff = Int.MaxValue
-      
-      while (j < n) {
-        val diff = math.abs(sums(j) - arr(i))
-        if (diff < minDiff) {
-          idx = j
-          minDiff = diff
-        }
-        j += 1
-      }
-      
-      subarrays(idx) = subarrays(idx) :+ arr(i)
-      sums(idx) += arr(i)
-      
-      splitRecursive(i + 1, sums)
-    }
-    
-    splitRecursive(0, Array.fill(n)(0))
-    subarrays
-  }
+  subarrays.toList
 }
