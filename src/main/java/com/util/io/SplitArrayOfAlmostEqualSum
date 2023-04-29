@@ -1,15 +1,15 @@
-import org.apache.spark.sql.DataFrame
+
+import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.functions._
 
-def splitArray(df: DataFrame, n: Int): Array[Array[Int]] = {
-  val arr = df.select(col("value").cast("Int")).as[Int].collect()
-  val sortedArr = arr.sorted.reverse
-  val subarrays = Array.fill(n)(Array.empty[Int])
-  for (x <- sortedArr) {
-    val idx = subarrays.zipWithIndex.minBy { case (subarray, _) => subarray.sum }._2
-    subarrays(idx) :+= x
-  }
-  subarrays
+def splitArray(df: DataFrame, n: Int): Array[Array[(Int, String)]] = {
+  val sortedDF = df.sort(desc("value")).select("id", "value")
+  val windowSpec = Window.partitionBy(lit(1)).orderBy(asc("cum_sum"))
+  val resultDF = sortedDF.select(col("*"), sum("value").over(windowSpec).alias("cum_sum"))
+    .withColumn("subarray", ((col("cum_sum")-1) / (col("cum_sum")/n)).cast("int"))
+  val result = resultDF.groupBy("subarray").agg(collect_list(struct("id", "value")).alias("subarray_values"))
+    .select("subarray_values").as[Seq[Row]].collect().map(_.toSeq.map(row => (row.getInt(0), row.getString(1))).toArray)
+  result
 }
 
 val input = Seq(("a", "5"), ("b", "3"), ("c", "8"), ("d", "1"), ("e", "2"), ("f", "6"), ("g", "7"), ("h", "4")).toDF("id", "value")
