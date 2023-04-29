@@ -1,17 +1,15 @@
-import org.apache.spark.sql.functions.{col, when, min, sum}
-import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.functions._
 
 def splitArray(df: DataFrame, n: Int): Array[Array[Int]] = {
-  val sortedDf = df.sort(col("value").desc)
+  val arr = df.select("value").rdd.map(r => r(0).asInstanceOf[Int]).collect().sorted.reverse
   val subarrays = Array.fill(n)(Array.empty[Int])
-  sortedDf.select(col("value")).collect().foreach { row =>
-    val (idx, _) = subarrays.zipWithIndex.map { case (subarray, idx) =>
-      (sum(subarray), idx)
-    }.reduceLeft((a, b) => if (a._1 < b._1) a else b)
-    subarrays(idx) :+= row.getInt(0)
+  for (x <- arr) {
+    val idx = subarrays.zipWithIndex.minBy { case (subarray, _) => subarray.reduce(_ + _) }._2
+    subarrays(idx) = subarrays(idx) :+ x
   }
   subarrays
 }
+
 
 val arr = Seq(11, 20, 2, 4, 8, 13, 16, 0, 1, 0, 3, 6)
 val df = arr.toDF("value")
