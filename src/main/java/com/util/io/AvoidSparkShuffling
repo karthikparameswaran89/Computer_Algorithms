@@ -1,21 +1,47 @@
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{DataFrame, Row, SparkSession, Window}
+import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
 
-val distinctCols = df.columns
-val windowSpec = Window.partitionBy(distinctCols.map(col): _*)
+// Define a case class to hold the data
+case class MyData(col1: String, col2: Int, col3: Double, col4: Boolean)
 
-val distinctDF = df.mapPartitions(rows => {
-  val seen = scala.collection.mutable.Set.empty[Seq[Any]]
-  rows.filter(row => {
-    val key = distinctCols.map(row.get)
-    if (seen.contains(key)) {
-      false
-    } else {
-      seen += key
-      true
+object Main {
+  def main(args: Array[String]): Unit = {
+    val spark = SparkSession.builder().appName("DistinctByMultipleColumns").master("local[*]").getOrCreate()
+
+    import spark.implicits._
+
+    // Create some sample data
+    val data = Seq(
+      MyData("foo", 1, 2.0, true),
+      MyData("foo", 2, 3.0, true),
+      MyData("bar", 1, 4.0, false),
+      MyData("baz", 2, 5.0, false),
+      MyData("baz", 3, 6.0, true),
+      MyData("qux", 1, 7.0, false),
+      MyData("qux", 2, 8.0, true),
+      MyData("quux", 3, 9.0, false),
+      MyData("quux", 4, 10.0, true)
+    )
+
+    // Convert the data to a DataFrame
+    val df = data.toDF()
+
+    // Define the columns to use for distinct operation
+    val distinctCols = Seq("col1", "col2", "col3", "col4")
+
+    // Define a window function to apply distinct operation on each partition
+    def distinctPartition(cols: Seq[Column]): DataFrame => DataFrame = { df =>
+      df
+        .groupBy(cols: _*)
+        .agg(first(cols.head), first(cols(1)), first(cols(2)), first(cols(3)))
     }
-  })
-})(spark.implicits.rowEncoder(df.schema))
-  .withColumn("row_num", row_number().over(windowSpec))
-  .filter($"row_num" === 1)
-  .drop("row_num")
+
+    // Apply distinct operation on each partition separately
+    val distinctDF = df
+      .repartition($"col1")
+      .mapPartitions(distinctPartition(distinctCols))(RowEncoder(df.schema))
+
+    // Show the distinct result
+    distinctDF.show()
+  }
+}
