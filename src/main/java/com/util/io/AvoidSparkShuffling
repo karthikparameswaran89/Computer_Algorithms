@@ -1,13 +1,21 @@
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.{DataFrame, Row, SparkSession, Window}
 
-// Assuming you have a DataFrame named 'df' that is already partitioned by the 'column_name' column
-val distinctCols = Seq("column_name_1", "column_name_2", "column_name_3")
+val distinctCols = df.columns
+val windowSpec = Window.partitionBy(distinctCols.map(col): _*)
 
-val distinctDf = df
-  .select(distinctCols.head, distinctCols.tail:_*) // Select the columns to perform distinct on
-  .withColumn("rank", row_number().over(Window.partitionBy(distinctCols.map(col(_)): _*).orderBy(monotonically_increasing_id()))) // Add a unique rank to each row within its partition
-  .filter(col("rank") === 1) // Filter out all but the first row in each partition
-
-// Cache the resulting DataFrame to avoid recomputation
-distinctDf.cache()
+val distinctDF = df.mapPartitions(rows => {
+  val seen = scala.collection.mutable.Set.empty[Seq[Any]]
+  rows.filter(row => {
+    val key = distinctCols.map(row.get)
+    if (seen.contains(key)) {
+      false
+    } else {
+      seen += key
+      true
+    }
+  })
+})(spark.implicits.rowEncoder(df.schema))
+  .withColumn("row_num", row_number().over(windowSpec))
+  .filter($"row_num" === 1)
+  .drop("row_num")
