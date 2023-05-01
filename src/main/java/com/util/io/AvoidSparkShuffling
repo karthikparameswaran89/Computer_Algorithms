@@ -18,4 +18,4 @@ def distinctPartition(iterator: Iterator[Row], colNames: List[String]): Iterator
 }
 
 val distinctCols = List("col1", "col2", "col3")
-val distinctDF = df.rdd.mapPartitions(iter => distinctPartition(iter, distinctCols)).toDF()
+val distinctDF = df.mapPartitions(iter => distinctPartition(iter, distinctCols))(df.sparkSession.implicits.rowEncoder(df.schema))
