@@ -1,47 +1,43 @@
-import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
+import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions.{col, row_number}
+import org.apache.spark.sql.types.StructType
 
-// Define a case class to hold the data
-case class MyData(col1: String, col2: Int, col3: Double, col4: Boolean)
-
-object Main {
-  def main(args: Array[String]): Unit = {
-    val spark = SparkSession.builder().appName("DistinctByMultipleColumns").master("local[*]").getOrCreate()
-
-    import spark.implicits._
-
-    // Create some sample data
-    val data = Seq(
-      MyData("foo", 1, 2.0, true),
-      MyData("foo", 2, 3.0, true),
-      MyData("bar", 1, 4.0, false),
-      MyData("baz", 2, 5.0, false),
-      MyData("baz", 3, 6.0, true),
-      MyData("qux", 1, 7.0, false),
-      MyData("qux", 2, 8.0, true),
-      MyData("quux", 3, 9.0, false),
-      MyData("quux", 4, 10.0, true)
-    )
-
-    // Convert the data to a DataFrame
-    val df = data.toDF()
-
-    // Define the columns to use for distinct operation
-    val distinctCols = Seq("col1", "col2", "col3", "col4")
-
-    // Define a window function to apply distinct operation on each partition
-    def distinctPartition(cols: Seq[Column]): DataFrame => DataFrame = { df =>
-      df
-        .groupBy(cols: _*)
-        .agg(first(cols.head), first(cols(1)), first(cols(2)), first(cols(3)))
-    }
-
-    // Apply distinct operation on each partition separately
-    val distinctDF = df
-      .repartition($"col1")
-      .mapPartitions(distinctPartition(distinctCols))(RowEncoder(df.schema))
-
-    // Show the distinct result
-    distinctDF.show()
+// Function to compute distinct values partition-wise for the given columns
+def distinctPartition(cols: Seq[String])(iter: Iterator[Row]): Iterator[Row] = {
+  val seen = collection.mutable.Set.empty[Seq[Any]]
+  iter.filter { row =>
+    val values = cols.map(col => row.getAs(col))
+    seen.add(values)
   }
 }
+
+// Function to apply distinctPartition function on each partition and return a DataFrame
+def distinctDataFrame(df: DataFrame, distinctCols: Seq[String]): DataFrame = {
+  val partitionCols = Seq("column_name_1") // Update with the actual partition column(s)
+  val windowSpec = Window.partitionBy(partitionCols.map(col): _*).orderBy(partitionCols.map(col): _*)
+
+  val distinctDF = df
+    .withColumn("row_num", row_number().over(windowSpec))
+    .filter($"row_num" === 1)
+    .drop("row_num")
+  
+  // Apply distinctPartition function on each partition
+  distinctDF
+    .repartition(partitionCols.map(col): _*)
+    .mapPartitions(distinctPartition(distinctCols))(RowEncoder.apply(StructType(df.schema.fields)))
+    .toDF()
+}
+
+// Example usage
+val df = Seq(
+  (1, "John", 25),
+  (2, "Jane", 30),
+  (3, "John", 25),
+  (4, "Mike", 35),
+  (5, "Jane", 30)
+).toDF("id", "name", "age")
+
+val distinctCols = Seq("name", "age")
+val distinctDF = distinctDataFrame(df, distinctCols)
+distinctDF.show()
