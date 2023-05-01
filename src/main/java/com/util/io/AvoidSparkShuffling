@@ -1,0 +1,15 @@
+# Assuming you have a DataFrame named 'df' that is already partitioned by the 'column_name' column
+num_partitions = df.rdd.getNumPartitions()
+
+# Repartition the DataFrame to ensure that it is partitioned based on the desired column
+df = df.repartition(num_partitions, "column_name")
+
+# Apply partition-wise distinct on each partition separately
+def distinct_partition(iterator):
+    seen = set()
+    for row in iterator:
+        if row['column_name'] not in seen:
+            seen.add(row['column_name'])
+            yield row
+
+distinct_df = df.rdd.mapPartitions(distinct_partition).toDF()
