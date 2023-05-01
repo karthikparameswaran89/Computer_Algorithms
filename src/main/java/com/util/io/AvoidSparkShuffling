@@ -1,21 +1,20 @@
 // Assuming you have a DataFrame named 'df' that is already partitioned by the 'column_name' column
+val columns = List("column1", "column2", "column3")
 val num_partitions = df.rdd.getNumPartitions()
 
 // Repartition the DataFrame to ensure that it is partitioned based on the desired column
-val df_repartitioned = df.repartition(num_partitions, $"column_name")
+df = df.repartition(num_partitions, "column_name")
 
 // Apply partition-wise distinct on each partition separately
-def distinctPartition(iterator: Iterator[Row]): Iterator[Row] = {
-  var seen = Set.empty[Any]
-  iterator.filter { row =>
-    val columnValue = row.getAs[Any]("column_name")
-    if (!seen(columnValue)) {
-      seen += columnValue
-      true
-    } else {
-      false
+def distinct_partition(iterator: Iterator[Row]): Iterator[Row] = {
+    val seen = scala.collection.mutable.Set[List[Any]]()
+    for (row <- iterator) {
+        val columnsValues = columns.map(c => row.getAs(c))
+        if (!seen.contains(columnsValues)) {
+            seen += columnsValues
+            yield row
+        }
     }
-  }
 }
 
-val distinct_df = df_repartitioned.rdd.mapPartitions(distinctPartition).toDF()
+val distinct_df = df.rdd.mapPartitions(distinct_partition).toDF()
