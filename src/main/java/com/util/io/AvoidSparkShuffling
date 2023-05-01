@@ -1,29 +1,21 @@
-import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{DataFrame, SparkSession, Row}
+import org.apache.spark.sql.Row
 
-val spark = SparkSession.builder().getOrCreate()
+def distinctPartition(iterator: Iterator[Row], colNames: List[String]): Iterator[Row] = {
+  var seen = Set[List[Any]]()
+  var result = List[Row]()
 
-// Assuming Column_1 is the partitioned column
-val partitionColumn = "Column_1"
+  while (iterator.hasNext) {
+    val row = iterator.next()
+    val key = colNames.map(c => row.getAs(c))
 
-val distinctCols = df.columns.toSeq
-val windowSpec = Window.partitionBy(distinctCols.map(col): _*)
+    if (!seen.contains(key)) {
+      seen += key
+      result ::= Row.fromSeq(row.toSeq)
+    }
+  }
 
-val distinctDF = df
-  .repartition(col(partitionColumn)) // Repartition by the partition column
-  .sortWithinPartitions(col(partitionColumn)) // Sort within each partition
-  .mapPartitions(rows => {
-    val seen = scala.collection.mutable.Set.empty[Seq[Any]]
-    rows.filter(row => {
-      val key = distinctCols.map(row.get)
-      if (seen.contains(key)) {
-        false
-      } else {
-        seen += key
-        true
-      }
-    })
-  })(org.apache.spark.sql.Encoders.tuple(Row.fromSeq(df.schema.map(_.dataType)): _*))
-  .withColumn("row_num", row_number().over(windowSpec))
-  .filter($"row_num" === 1)
-  .drop("row_num")
+  result.iterator
+}
+
+val distinctCols = List("col1", "col2", "col3")
+val distinctDF = df.rdd.mapPartitions(iter => distinctPartition(iter, distinctCols)).toDF()
