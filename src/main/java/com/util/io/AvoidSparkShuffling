@@ -1,12 +1,12 @@
 import org.apache.spark.sql.Row
 
-def distinctPartition(iterator: Iterator[Row], colNames: List[String]): Iterator[Row] = {
+def distinctPartition(iterator: Iterator[Row], distinctCols: Seq[String]): Iterator[Row] = {
   var seen = Set[List[Any]]()
   var result = List[Row]()
 
   while (iterator.hasNext) {
     val row = iterator.next()
-    val key = colNames.map(c => row.getAs(c))
+    val key = distinctCols.map(c => row.getAs(c))
 
     if (!seen.contains(key)) {
       seen += key
@@ -17,5 +17,12 @@ def distinctPartition(iterator: Iterator[Row], colNames: List[String]): Iterator
   result.iterator
 }
 
-val distinctCols = List("col1", "col2", "col3")
-val distinctDF = df.rdd.mapPartitions(iter => distinctPartition(iter, distinctCols)).toDF()
+val distinctCols = df.columns.filter(_ != "Column_1")
+val windowSpec = Window.partitionBy("Column_1")
+val distinctDF = df
+  .select(col("Column_1"), expr("*"))
+  .withColumn("distinct", mapPartitions((rows: Iterator[Row]) => distinctPartition(rows, distinctCols)))
+  .withColumn("row_num", row_number().over(windowSpec))
+  .filter($"row_num" === 1)
+  .drop("row_num")
+  .drop("distinct")
