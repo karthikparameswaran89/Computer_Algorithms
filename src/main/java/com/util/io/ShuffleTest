@@ -1,0 +1,72 @@
+import org.apache.spark.sql.functions.{col, lit, row_number}
+import org.apache.spark.sql.expressions.Window
+
+// Load the table into a DataFrame
+val df = spark.read.format("csv")
+  .option("header", "true")
+  .option("inferSchema", "true")
+  .load("table.csv")
+
+// Assign a unique ID to each row
+val w = Window.orderBy("name", "age")
+val dfWithId = df.withColumn("id", row_number().over(w))
+
+// Determine the number of rows in the DataFrame
+val numRows = dfWithId.count()
+
+// Calculate the desired number of rows per split value
+val numPerSplit = numRows / 500
+
+// Calculate the remainder
+val remainder = numRows % 500
+
+// Assign split values to rows
+val dfWithSplit = dfWithId
+  // Calculate the split value based on the row number
+  .withColumn("split", ((col("id") - 1) / numPerSplit + 1).cast("int"))
+  // Assign the remaining rows to the first split values
+  .withColumn("split", when(col("split") <= remainder, col("split")).otherwise(col("split") + 1))
+
+// Check if there are any duplicate split values for a given name and age
+val duplicateCheck = dfWithSplit.groupBy("name", "age", "split").count().where(col("count") > 1).count()
+
+// If there are no duplicate split values, return the result; otherwise, try a different method
+if (duplicateCheck == 0) {
+  dfWithSplit.drop("id")
+} else {
+  // Calculate the counts for each split value
+  val splitCounts = dfWithSplit.groupBy("split").count().orderBy("split").cache()
+
+  // Calculate the variance of the counts
+  val variance = splitCounts.selectExpr("variance(count)").first().getDouble(0)
+
+  // Iterate until the variance is minimized
+  var i = 1
+  var minVariance = variance
+  var bestSplit = dfWithSplit
+  while (i < 100) {
+    // Shuffle the rows randomly
+    val shuffled = dfWithSplit.orderBy(rand())
+
+    // Assign split values based on the shuffled order
+    val shuffledWithSplit = shuffled.withColumn("split", lit(null).cast("int"))
+      .withColumn("split", (row_number().over(w) - 1) % 500 + 1)
+
+    // Calculate the counts for each split value
+    val shuffledSplitCounts = shuffledWithSplit.groupBy("split").count().orderBy("split").cache()
+
+    // Calculate the variance of the counts
+    val shuffledVariance = shuffledSplitCounts.selectExpr("variance(count)").first().getDouble(0)
+
+    // If the variance is smaller, update the best split DataFrame
+    if (shuffledVariance < minVariance) {
+      minVariance = shuffledVariance
+      bestSplit = shuffledWithSplit
+    }
+
+    i += 1
+  }
+
+  // Drop the ID column from the best split DataFrame and return the result
+  bestSplit.drop("id")
+}
