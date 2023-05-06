@@ -1,0 +1,132 @@
+package org.karthik
+
+import jdk.internal.org.jline.keymap.KeyMap.del
+
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.time.temporal.TemporalAdjusters.{lastDayOfMonth, lastDayOfYear}
+import java.time.temporal._
+import scala.collection.mutable
+import scala.collection.mutable.ListBuffer
+
+
+object TrendComputationWeekly {
+  def main(args: Array[String]) {
+
+    case class DateRange[T <: Temporal](from: T, to: T) {
+      def every(i: Int, chronoUnit: ChronoUnit)(implicit ord: Ordering[T]): LazyList[T] =
+        LazyList.iterate(from)(t => {
+          chronoUnit match {
+            case ChronoUnit.YEARS => t.plus(i, chronoUnit).`with`(lastDayOfYear).asInstanceOf[T]
+            case ChronoUnit.MONTHS => t.plus(i, chronoUnit).`with`(lastDayOfMonth).asInstanceOf[T]
+            case ChronoUnit.DAYS => t.plus(i, chronoUnit).asInstanceOf[T]
+          }
+        }).takeWhile(ord.lteq(_, to))
+    }
+
+
+    val strPeriod = 'M'
+    val strTrend_Type = "flow"
+    //val a = List("20230310" -> List(200.0, 210.0, 220.0, 230.0), "20230324" -> List(100.0, 110.0, 120.0, 130.0), "20230331" -> List(300.0, 310.0, 320.0, 330.0), "20230414" -> List(400.0, 410.0, 420.0, 430.0))
+    val a = List("20190531" -> List(200.0, 210.0, 220.0, 230.0), "20190131" -> List(100.0, 110.0, 120.0, 130.0), "20190630" -> List(300.0, 310.0, 320.0, 330.0), "20191031" -> List(400.0, 410.0, 420.0, 430.0))
+    val lstNewTrend = List(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    val lstCurreny = List(0, 1, 2, 3)
+    var mapInputValues = a.map(x => (x._1, x._2 //.appendedAll(lstNewTrend)
+    )).toSeq.toMap
+
+    def formatter = DateTimeFormatter.ofPattern("yyyyMMdd")
+
+    var mapKeyDates = mapInputValues.map(_._1)
+    val dtStartDate = LocalDate.parse(mapKeyDates.min, formatter)
+    var dtrEndDate = LocalDate.parse(mapKeyDates.max, formatter).`with`(lastDayOfYear)
+    var lstFilledDates = List[LocalDate]()
+    if (strPeriod == 'W') {
+      dtrEndDate = LocalDate.parse(mapKeyDates.max, formatter).plusDays(21)
+      lstFilledDates = DateRange(dtStartDate, dtrEndDate).every(7, ChronoUnit.DAYS).toList
+    } else {
+      lstFilledDates = DateRange(dtStartDate, dtrEndDate).every(1, ChronoUnit.MONTHS).toList
+    }
+
+
+    var mapFilledData = collection.mutable.Map[String, ListBuffer[Double]]()
+
+    lstFilledDates.foreach(x => {
+      var tempList = mutable.ListBuffer(mapInputValues.get(x.format(formatter)).getOrElse(List(0.0, 0.0, 0.0, 0.0) //.appendedAll(lstNewTrend)
+      ): _*)
+      mapFilledData += (x.format(formatter) -> tempList)
+    })
+    var arrFinal = mutable.ListBuffer(mapFilledData.toSeq.sortBy(_._1): _*)
+    for (i <- 0 until arrFinal.length) {
+      val intMonthNumber = arrFinal(i)._1.substring(4, 6).toInt
+      val intQuarterNumber = {
+        arrFinal(i)._1.substring(4, 6).toInt match {
+          case x if x < 4 => 1
+          case x if x < 7 => 2
+          case x if x < 10 => 3
+          case _ => 4
+        }
+      }
+      val intYearNumber = arrFinal(i)._1.substring(0, 4).toInt - arrFinal(0)._1.substring(0, 4).toInt + 1
+      strTrend_Type match {
+        case "flow" => {
+          //FOUR_WEEK_Average
+          if (i > 2 && strPeriod == 'W') {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(x) + arrFinal(i - 2)._2(x) + arrFinal(i - 3)._2(x)) / 4 }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(tempValue))
+          } else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+          //QTD
+          if (strPeriod == 'M') {
+            if (List(1, 4, 7, 10).contains(intMonthNumber)) {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(tempValue))
+            }
+            else {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(8 + x)) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(tempValue))
+            }
+          }
+          else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+          //YTD
+          if (strPeriod == 'M') {
+            if (1 == intMonthNumber) {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(tempValue))
+            }
+            else {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(12 + x)) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(tempValue))
+            }
+          } else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+        }
+        case "balance" => {
+          //FOUR_WEEK_Average
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(tempValue))
+          }
+          //QTD
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(tempValue))
+          }
+          //YTD
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.appendedAll(tempValue))
+          }
+        }
+      }
+      //      println(arrFinal(i) + ":" + intMonthNumber + ":" + intQuarterNumber + ":" + intYearNumber)
+    }
+    arrFinal.map(x => println(x._1 :: x._2.toList))
+  }
+}
