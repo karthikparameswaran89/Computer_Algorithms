@@ -1,0 +1,213 @@
+package org.karthik
+
+import java.time.format.DateTimeFormatter
+import java.time.LocalDate
+import java.time.temporal.TemporalAdjusters.{lastDayOfMonth, lastDayOfYear}
+
+import scala.collection.mutable
+import scala.collection.mutable.ListBuffer
+
+
+object TrendComputation {
+  def main(args: Array[String]) {
+
+    def generateMonthEndDates(startDate: LocalDate, endDate: LocalDate, increment: Int): Iterator[LocalDate] = {
+      Iterator.iterate(startDate)(date => date.plusMonths(increment)).takeWhile(!_.isAfter(endDate))
+        .map(date => date.`withDayOfMonth`(date.lengthOfMonth()))
+    }
+
+    def generateDates(startDate: LocalDate, endDate: LocalDate, increment: Int): Iterator[LocalDate] = {
+      Iterator.iterate(startDate)(_.plusDays(increment)).takeWhile(!_.isAfter(endDate))
+    }
+
+
+    val strPeriod = "M"
+    val strTrend_Type = "flow"
+    //val a = List("20230310" -> List(200.0, 210.0, 220.0, 230.0), "20230324" -> List(100.0, 110.0, 120.0, 130.0), "20230331" -> List(300.0, 310.0, 320.0, 330.0), "20230414" -> List(400.0, 410.0, 420.0, 430.0))
+    val a = List("20190531" -> List(200.0, 210.0, 220.0, 230.0), "20190131" -> List(100.0, 110.0, 120.0, 130.0), "20190630" -> List(300.0, 310.0, 320.0, 330.0), "20191031" -> List(400.0, 410.0, 420.0, 430.0))
+    val lstCurreny = List(0, 1, 2, 3)
+    val lstForAdditionalTrends=List(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    var mapInputValues = a.map(x => (x._1, x._2)).toSeq.toMap
+
+    def formatter = DateTimeFormatter.ofPattern("yyyyMMdd")
+
+
+    var mapKeyDates = mapInputValues.map(_._1)
+    val dtStartDate = LocalDate.parse(mapKeyDates.min, formatter)
+    var dtrEndDate = LocalDate.parse(mapKeyDates.max, formatter).`with`(lastDayOfYear)
+
+    val dateIterator = if (strPeriod == "M") {
+      generateMonthEndDates(dtStartDate, dtrEndDate, 1)
+    } else if (strPeriod == "W") {
+      generateDates(dtStartDate, dtrEndDate, 7)
+    } else {
+      throw new IllegalArgumentException("Invalid period: " + strPeriod)
+    }
+
+    var lstFilledDates = dateIterator.map(date => date.format(formatter)).toList
+
+
+    var mapFilledData = collection.mutable.Map[String, ListBuffer[Double]]()
+
+    import scala.collection.mutable.ListBuffer
+    var filledList = ListBuffer[ListBuffer[Any]]()
+    lstFilledDates.foreach(x => {
+      val lstOriginal = mapInputValues.get(x.format(formatter)).getOrElse(List(0.0, 0.0, 0.0, 0.0))
+      filledList += ListBuffer(x) ++ lstOriginal //++ lstForAdditionalTrends
+    })
+    filledList.foreach(x=>println(x))
+
+
+    for(i <- 0 until filledList.length){
+      val strRunningDate=filledList(i)(0).toString
+      val intMonthNumber = strRunningDate.substring(4, 6).toInt
+      val intQuarterNumber = {
+        strRunningDate.substring(4, 6).toInt match {
+          case x if x < 4 => 1
+          case x if x < 7 => 2
+          case x if x < 10 => 3
+          case _ => 4
+        }
+      }
+      val intYearNumber = strRunningDate.substring(0, 4).toInt - strRunningDate.substring(0, 4).toInt + 1
+
+      strTrend_Type match {
+        case "flow" => {
+          //FOUR_WEEK_Average
+          if (i > 2 && strPeriod == "W") {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(x) + arrFinal(i - 2)._2(x) + arrFinal(i - 3)._2(x)) / 4 }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ tempValue)
+          } else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+          //QTD
+          if (strPeriod == "M") {
+            if (List(1, 4, 7, 10).contains(intMonthNumber)) {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+            }
+            else {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(8 + x)) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+            }
+          }
+          else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+          //YTD
+          if (strPeriod == "M") {
+            if (1 == intMonthNumber) {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+            }
+            else {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(12 + x)) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+            }
+          } else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+        }
+        case "balance" => {
+          //FOUR_WEEK_Average
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+          }
+          //QTD
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.++(tempValue))
+          }
+          //YTD
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+          }
+        }
+      }
+    }
+
+    lstFilledDates.foreach(x => {
+      var tempList = mutable.ListBuffer(mapInputValues.get(x.format(formatter)).getOrElse(List(0.0, 0.0, 0.0, 0.0) //.appendedAll(lstNewTrend)
+      ): _*)
+      mapFilledData += (x.format(formatter) -> tempList)
+    })
+    var arrFinal = mutable.ListBuffer(mapFilledData.toSeq.sortBy(_._1): _*)
+    for (i <- 0 until arrFinal.length) {
+      val intMonthNumber = arrFinal(i)._1.substring(4, 6).toInt
+      val intQuarterNumber = {
+        arrFinal(i)._1.substring(4, 6).toInt match {
+          case x if x < 4 => 1
+          case x if x < 7 => 2
+          case x if x < 10 => 3
+          case _ => 4
+        }
+      }
+      val intYearNumber = arrFinal(i)._1.substring(0, 4).toInt - arrFinal(0)._1.substring(0, 4).toInt + 1
+      strTrend_Type match {
+        case "flow" => {
+          //FOUR_WEEK_Average
+          if (i > 2 && strPeriod == "W") {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(x) + arrFinal(i - 2)._2(x) + arrFinal(i - 3)._2(x)) / 4 }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ tempValue)
+          } else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+          //QTD
+          if (strPeriod == "M") {
+            if (List(1, 4, 7, 10).contains(intMonthNumber)) {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+            }
+            else {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(8 + x)) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+            }
+          }
+          else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+          //YTD
+          if (strPeriod == "M") {
+            if (1 == intMonthNumber) {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+            }
+            else {
+              var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ (arrFinal(i)._2(x) + arrFinal(i - 1)._2(12 + x)) }
+              arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+            }
+          } else {
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ 0.0 }))
+          }
+
+        }
+        case "balance" => {
+          //FOUR_WEEK_Average
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+          }
+          //QTD
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2.++(tempValue))
+          }
+          //YTD
+          {
+            var tempValue = lstCurreny.foldLeft(ListBuffer[Double]()) { (accumulator, x) => accumulator :+ arrFinal(i)._2(x) }
+            arrFinal(i) = (arrFinal(i)._1, arrFinal(i)._2 ++ (tempValue))
+          }
+        }
+      }
+      //      println(arrFinal(i) + ":" + intMonthNumber + ":" + intQuarterNumber + ":" + intYearNumber)
+    }
+    arrFinal.map(x => println(x._1 :: x._2.toList))
+  }
+}
