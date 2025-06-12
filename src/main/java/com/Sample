@@ -1,89 +1,160 @@
-mport java.io.*;
 import java.util.*;
 
-public class JilParserWithMultiline {
+public class Job {
+    public String name;
+    public Map<String, String> attributes = new LinkedHashMap<>();
+    public List<String> dependencies = new ArrayList<>();
 
-    public static Map<String, Map<String, String>> parseJilFile(String filePath) throws IOException {
-        Map<String, Map<String, String>> jobsMap = new LinkedHashMap<>();
-        BufferedReader reader = new BufferedReader(new FileReader(filePath));
+    public Job(String name) {
+        this.name = name;
+    }
 
-        String line;
-        String currentJob = null;
-        Map<String, String> currentSettings = null;
-        String currentKey = null;
-        StringBuilder currentValueBuilder = null;
+    @Override
+    public String toString() {
+        return "Job: " + name + "\n  Attributes: " + attributes + "\n  Dependencies: " + dependencies;
+    }
+}
 
-        while ((line = reader.readLine()) != null) {
-            // Handle comments and trim
-            if (line.trim().isEmpty() || line.trim().startsWith("#")) continue;
+import java.util.*;
+import java.util.regex.*;
 
-            // Detect job start
-            if (line.startsWith("insert_job:")) {
-                // Save previous job
-                if (currentJob != null && currentSettings != null) {
-                    jobsMap.put(currentJob, currentSettings);
+public class DependencyExtractor {
+
+    public static List<String> extractSuccessDependencies(String condition) {
+        List<String> dependencies = new ArrayList<>();
+        if (condition == null || condition.isEmpty()) return dependencies;
+
+        Matcher matcher = Pattern.compile("\\b(s|success)\\s*\\(\\s*([a-zA-Z0-9_\\.\\-]+)").matcher(condition);
+        while (matcher.find()) {
+            String job = matcher.group(2);
+            dependencies.add(job);
+        }
+        return dependencies;
+    }
+}
+
+
+import java.util.*;
+
+public class TopologicalSorter {
+
+    public static LinkedHashMap<String, Job> sort(Map<String, Job> jobMap) {
+        LinkedHashMap<String, Job> sortedJobs = new LinkedHashMap<>();
+        Set<String> visited = new HashSet<>();
+        Set<String> visiting = new HashSet<>();
+
+        for (String jobName : jobMap.keySet()) {
+            if (!visited.contains(jobName)) {
+                if (!dfs(jobName, jobMap, visited, visiting, sortedJobs)) {
+                    throw new RuntimeException("Cycle detected in job dependencies.");
                 }
-
-                // Reset for new job
-                currentSettings = new LinkedHashMap<>();
-                currentKey = null;
-                currentValueBuilder = null;
-
-                String[] parts = line.trim().split("\\s+");
-                currentJob = parts[1];
-                if (parts.length >= 4 && "job_type:".equals(parts[2])) {
-                    currentSettings.put("job_type", parts[3]);
-                }
-
-            } else if (line.contains(":")) {
-                // Store previous key-value if in progress
-                if (currentKey != null && currentValueBuilder != null) {
-                    currentSettings.put(currentKey, currentValueBuilder.toString().trim());
-                }
-
-                // Start new key-value
-                int colonIndex = line.indexOf(':');
-                currentKey = line.substring(0, colonIndex).trim();
-                String value = line.substring(colonIndex + 1).trim();
-
-                currentValueBuilder = new StringBuilder();
-                currentValueBuilder.append(value);
-
-            } else if (currentKey != null && currentValueBuilder != null) {
-                // Continuation of multiline value
-                currentValueBuilder.append("\n").append(line.trim());
             }
         }
 
-        // Save last job
-        if (currentJob != null && currentSettings != null) {
-            if (currentKey != null && currentValueBuilder != null) {
-                currentSettings.put(currentKey, currentValueBuilder.toString().trim());
+        return sortedJobs;
+    }
+
+    private static boolean dfs(String jobName, Map<String, Job> jobMap, Set<String> visited,
+                               Set<String> visiting, LinkedHashMap<String, Job> result) {
+        if (visiting.contains(jobName)) return false; // cycle
+        if (visited.contains(jobName)) return true;
+
+        visiting.add(jobName);
+        Job job = jobMap.get(jobName);
+        if (job != null) {
+            for (String dep : job.dependencies) {
+                if (jobMap.containsKey(dep)) {
+                    if (!dfs(dep, jobMap, visited, visiting, result)) return false;
+                }
             }
-            jobsMap.put(currentJob, currentSettings);
+        }
+
+        visiting.remove(jobName);
+        visited.add(jobName);
+        result.put(jobName, job);
+        return true;
+    }
+}
+
+
+import java.io.*;
+import java.util.*;
+
+public class JilDependencyParser {
+
+    public static Map<String, Job> parseJobsWithDependencies(String filePath) throws IOException {
+        Map<String, Job> jobMap = new LinkedHashMap<>();
+
+        BufferedReader reader = new BufferedReader(new FileReader(filePath));
+        String line;
+        String currentJobName = null;
+        Job currentJob = null;
+        String currentKey = null;
+        StringBuilder valueBuilder = null;
+
+        while ((line = reader.readLine()) != null) {
+            line = line.trim();
+            if (line.isEmpty() || line.startsWith("#")) continue;
+
+            if (line.startsWith("insert_job:")) {
+                if (currentJob != null) {
+                    String cond = currentJob.attributes.get("condition");
+                    currentJob.dependencies = DependencyExtractor.extractSuccessDependencies(cond);
+                    jobMap.put(currentJobName, currentJob);
+                }
+
+                String[] parts = line.split("\\s+");
+                currentJobName = parts[1];
+                currentJob = new Job(currentJobName);
+                if (parts.length >= 4 && parts[2].equals("job_type:")) {
+                    currentJob.attributes.put("job_type", parts[3]);
+                }
+                currentKey = null;
+                valueBuilder = null;
+
+            } else if (line.contains(":")) {
+                if (currentKey != null && valueBuilder != null) {
+                    currentJob.attributes.put(currentKey, valueBuilder.toString().trim());
+                }
+                int idx = line.indexOf(':');
+                currentKey = line.substring(0, idx).trim();
+                String value = line.substring(idx + 1).trim();
+                valueBuilder = new StringBuilder(value);
+
+            } else if (currentKey != null && valueBuilder != null) {
+                valueBuilder.append("\n").append(line.trim());
+            }
+        }
+
+        if (currentJob != null) {
+            if (currentKey != null && valueBuilder != null) {
+                currentJob.attributes.put(currentKey, valueBuilder.toString().trim());
+            }
+            String cond = currentJob.attributes.get("condition");
+            currentJob.dependencies = DependencyExtractor.extractSuccessDependencies(cond);
+            jobMap.put(currentJobName, currentJob);
         }
 
         reader.close();
-        return jobsMap;
+        return jobMap;
     }
 
     public static void main(String[] args) {
         String jilFile = "autosys_jobs.jil";
 
         try {
-            Map<String, Map<String, String>> jobs = parseJilFile(jilFile);
+            Map<String, Job> parsedJobs = parseJobsWithDependencies(jilFile);
+            LinkedHashMap<String, Job> orderedJobs = TopologicalSorter.sort(parsedJobs);
 
-            for (String jobName : jobs.keySet()) {
-                System.out.println("Job: " + jobName);
-                Map<String, String> settings = jobs.get(jobName);
-                for (Map.Entry<String, String> entry : settings.entrySet()) {
-                    System.out.println("    " + entry.getKey() + ": " + entry.getValue().replace("\n", "\n    "));
-                }
+            for (Job job : orderedJobs.values()) {
+                System.out.println(job);
                 System.out.println();
             }
 
         } catch (IOException e) {
             e.printStackTrace();
+        } catch (RuntimeException e) {
+            System.err.println("Error: " + e.getMessage());
         }
     }
 }
