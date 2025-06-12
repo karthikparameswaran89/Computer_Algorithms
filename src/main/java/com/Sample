@@ -1,0 +1,89 @@
+mport java.io.*;
+import java.util.*;
+
+public class JilParserWithMultiline {
+
+    public static Map<String, Map<String, String>> parseJilFile(String filePath) throws IOException {
+        Map<String, Map<String, String>> jobsMap = new LinkedHashMap<>();
+        BufferedReader reader = new BufferedReader(new FileReader(filePath));
+
+        String line;
+        String currentJob = null;
+        Map<String, String> currentSettings = null;
+        String currentKey = null;
+        StringBuilder currentValueBuilder = null;
+
+        while ((line = reader.readLine()) != null) {
+            // Handle comments and trim
+            if (line.trim().isEmpty() || line.trim().startsWith("#")) continue;
+
+            // Detect job start
+            if (line.startsWith("insert_job:")) {
+                // Save previous job
+                if (currentJob != null && currentSettings != null) {
+                    jobsMap.put(currentJob, currentSettings);
+                }
+
+                // Reset for new job
+                currentSettings = new LinkedHashMap<>();
+                currentKey = null;
+                currentValueBuilder = null;
+
+                String[] parts = line.trim().split("\\s+");
+                currentJob = parts[1];
+                if (parts.length >= 4 && "job_type:".equals(parts[2])) {
+                    currentSettings.put("job_type", parts[3]);
+                }
+
+            } else if (line.contains(":")) {
+                // Store previous key-value if in progress
+                if (currentKey != null && currentValueBuilder != null) {
+                    currentSettings.put(currentKey, currentValueBuilder.toString().trim());
+                }
+
+                // Start new key-value
+                int colonIndex = line.indexOf(':');
+                currentKey = line.substring(0, colonIndex).trim();
+                String value = line.substring(colonIndex + 1).trim();
+
+                currentValueBuilder = new StringBuilder();
+                currentValueBuilder.append(value);
+
+            } else if (currentKey != null && currentValueBuilder != null) {
+                // Continuation of multiline value
+                currentValueBuilder.append("\n").append(line.trim());
+            }
+        }
+
+        // Save last job
+        if (currentJob != null && currentSettings != null) {
+            if (currentKey != null && currentValueBuilder != null) {
+                currentSettings.put(currentKey, currentValueBuilder.toString().trim());
+            }
+            jobsMap.put(currentJob, currentSettings);
+        }
+
+        reader.close();
+        return jobsMap;
+    }
+
+    public static void main(String[] args) {
+        String jilFile = "autosys_jobs.jil";
+
+        try {
+            Map<String, Map<String, String>> jobs = parseJilFile(jilFile);
+
+            for (String jobName : jobs.keySet()) {
+                System.out.println("Job: " + jobName);
+                Map<String, String> settings = jobs.get(jobName);
+                for (Map.Entry<String, String> entry : settings.entrySet()) {
+                    System.out.println("    " + entry.getKey() + ": " + entry.getValue().replace("\n", "\n    "));
+                }
+                System.out.println();
+            }
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
