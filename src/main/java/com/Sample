@@ -1,115 +1,44 @@
-import java.util.List;
+import java.util.*;
 
-public class DatabricksJobConfig {
-    public String jobName;
-    public String sparkVersion;
-    public String nodeType;
-    public int numWorkers;
-    public String jarPath;
-    public String mainClass;
-    public List<String> parameters;
-    public int maxRetries;
+public class UnixStyleArgsParser {
+    public static void main(String[] args) {
+        Map<String, String> argMap = new HashMap<>();
+        List<String> extras = new ArrayList<>();
+        String scriptName = null;
 
-    public DatabricksJobConfig(String jobName, String sparkVersion, String nodeType, int numWorkers,
-                               String jarPath, String mainClass, List<String> parameters, int maxRetries) {
-        this.jobName = jobName;
-        this.sparkVersion = sparkVersion;
-        this.nodeType = nodeType;
-        this.numWorkers = numWorkers;
-        this.jarPath = jarPath;
-        this.mainClass = mainClass;
-        this.parameters = parameters;
-        this.maxRetries = maxRetries;
-    }
-}
+        for (int i = 0; i < args.length; i++) {
+            String current = args[i];
 
-
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.List;
-
-public class DatabricksJarJobSubmitter {
-
-    private static final String DATABRICKS_TOKEN = "dapiXXXXXXXXXXXXXXXXXXXXXXX";
-    private static final String DATABRICKS_HOST = "https://<your-workspace>.cloud.databricks.com";
-
-    public static void main(String[] args) throws Exception {
-        List<DatabricksJobConfig> jobs = Arrays.asList(
-            new DatabricksJobConfig(
-                "job-1",
-                "13.3.x-scala2.12",
-                "Standard_DS3_v2",
-                2,
-                "dbfs:/FileStore/my-jar/my-job1.jar",
-                "com.example.Job1Main",
-                Arrays.asList("argA", "argB"),
-                1
-            ),
-            new DatabricksJobConfig(
-                "job-2",
-                "13.3.x-scala2.12",
-                "Standard_DS3_v2",
-                3,
-                "dbfs:/FileStore/my-jar/my-job2.jar",
-                "com.example.Job2Main",
-                Arrays.asList("argX", "argY"),
-                2
-            )
-        );
-
-        for (DatabricksJobConfig job : jobs) {
-            submitJob(job);
-        }
-    }
-
-    private static void submitJob(DatabricksJobConfig job) throws Exception {
-        String paramArray = job.parameters.stream()
-            .map(p -> "\"" + p + "\"")
-            .reduce((p1, p2) -> p1 + ", " + p2)
-            .orElse("");
-
-        String jsonPayload = String.format("""
-            {
-              "name": "%s",
-              "new_cluster": {
-                "spark_version": "%s",
-                "node_type_id": "%s",
-                "num_workers": %d
-              },
-              "libraries": [
-                {
-                  "jar": "%s"
+            if ("--caller-script".equals(current)) {
+                if (i + 1 < args.length) {
+                    scriptName = args[i + 1];
+                    i++; // skip next one
                 }
-              ],
-              "spark_jar_task": {
-                "main_class_name": "%s",
-                "parameters": [%s]
-              },
-              "max_retries": %d
+            } else if (current.startsWith("-")) {
+                if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
+                    argMap.put(current, args[i + 1]);
+                    i++;
+                } else {
+                    argMap.put(current, null); // flag with no value
+                }
+            } else {
+                extras.add(current);
             }
-            """, job.jobName, job.sparkVersion, job.nodeType, job.numWorkers,
-                job.jarPath, job.mainClass, paramArray, job.maxRetries);
-
-        URL url = new URL(DATABRICKS_HOST + "/api/2.1/jobs/create");
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Authorization", "Bearer " + DATABRICKS_TOKEN);
-        conn.setRequestProperty("Content-Type", "application/json");
-        conn.setDoOutput(true);
-
-        try (OutputStream os = conn.getOutputStream()) {
-            byte[] input = jsonPayload.getBytes(StandardCharsets.UTF_8);
-            os.write(input, 0, input.length);
         }
 
-        int responseCode = conn.getResponseCode();
-        if (responseCode == 200 || responseCode == 201) {
-            System.out.printf("Job '%s' created successfully.%n", job.jobName);
-        } else {
-            System.err.printf("Failed to create job '%s'. Response code: %d%n", job.jobName, responseCode);
+        // Output
+        if (scriptName != null) {
+            System.out.println("Invoked via script: " + scriptName);
+        }
+
+        System.out.println("Flags and values:");
+        for (Map.Entry<String, String> entry : argMap.entrySet()) {
+            System.out.println(entry.getKey() + " = " + entry.getValue());
+        }
+
+        System.out.println("Positional/extra args:");
+        for (String extra : extras) {
+            System.out.println(extra);
         }
     }
 }
