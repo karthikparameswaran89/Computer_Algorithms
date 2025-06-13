@@ -1,44 +1,113 @@
 import java.util.*;
+import java.util.regex.*;
 
-public class UnixStyleArgsParser {
+public class SimulateUnixArgsWithQuotes {
     public static void main(String[] args) {
-        Map<String, String> argMap = new HashMap<>();
-        List<String> extras = new ArrayList<>();
-        String scriptName = null;
+        // Command line with quoted argument
+        String commandLine = "./a.sh -s value -b value1 -c value3 asdf \"asdfg text\"";
 
-        for (int i = 0; i < args.length; i++) {
-            String current = args[i];
+        // Use regex to handle quoted strings and unquoted tokens
+        List<String> tokens = tokenize(commandLine);
 
-            if ("--caller-script".equals(current)) {
-                if (i + 1 < args.length) {
-                    scriptName = args[i + 1];
-                    i++; // skip next one
-                }
-            } else if (current.startsWith("-")) {
-                if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
-                    argMap.put(current, args[i + 1]);
+        // Extract script name
+        String scriptName = tokens.get(0);
+
+        Map<String, String> flags = new LinkedHashMap<>();
+        List<String> positionalArgs = new ArrayList<>();
+
+        for (int i = 1; i < tokens.size(); i++) {
+            String current = tokens.get(i);
+            if (current.startsWith("-")) {
+                if (i + 1 < tokens.size() && !tokens.get(i + 1).startsWith("-")) {
+                    flags.put(current, tokens.get(i + 1));
                     i++;
                 } else {
-                    argMap.put(current, null); // flag with no value
+                    flags.put(current, null);
                 }
             } else {
-                extras.add(current);
+                positionalArgs.add(current);
             }
         }
 
-        // Output
-        if (scriptName != null) {
-            System.out.println("Invoked via script: " + scriptName);
-        }
-
-        System.out.println("Flags and values:");
-        for (Map.Entry<String, String> entry : argMap.entrySet()) {
+        System.out.println("Script name: " + scriptName);
+        System.out.println("\nFlags and values:");
+        for (Map.Entry<String, String> entry : flags.entrySet()) {
             System.out.println(entry.getKey() + " = " + entry.getValue());
         }
 
-        System.out.println("Positional/extra args:");
-        for (String extra : extras) {
-            System.out.println(extra);
+        System.out.println("\nPositional arguments:");
+        for (String arg : positionalArgs) {
+            System.out.println(arg);
         }
+    }
+
+    // Helper method: tokenize with support for quotes
+    private static List<String> tokenize(String input) {
+        List<String> tokens = new ArrayList<>();
+        Matcher m = Pattern.compile("\"([^\"]*)\"|(\\S+)").matcher(input);
+        while (m.find()) {
+            if (m.group(1) != null) {
+                tokens.add(m.group(1)); // quoted string without quotes
+            } else {
+                tokens.add(m.group(2)); // unquoted word
+            }
+        }
+        return tokens;
+    }
+}import java.util.*;
+import java.util.regex.*;
+
+public class SimulateUnixArgsWithQuotes {
+    public static void main(String[] args) {
+        // Command line with quoted argument
+        String commandLine = "./a.sh -s value -b value1 -c value3 asdf \"asdfg text\"";
+
+        // Use regex to handle quoted strings and unquoted tokens
+        List<String> tokens = tokenize(commandLine);
+
+        // Extract script name
+        String scriptName = tokens.get(0);
+
+        Map<String, String> flags = new LinkedHashMap<>();
+        List<String> positionalArgs = new ArrayList<>();
+
+        for (int i = 1; i < tokens.size(); i++) {
+            String current = tokens.get(i);
+            if (current.startsWith("-")) {
+                if (i + 1 < tokens.size() && !tokens.get(i + 1).startsWith("-")) {
+                    flags.put(current, tokens.get(i + 1));
+                    i++;
+                } else {
+                    flags.put(current, null);
+                }
+            } else {
+                positionalArgs.add(current);
+            }
+        }
+
+        System.out.println("Script name: " + scriptName);
+        System.out.println("\nFlags and values:");
+        for (Map.Entry<String, String> entry : flags.entrySet()) {
+            System.out.println(entry.getKey() + " = " + entry.getValue());
+        }
+
+        System.out.println("\nPositional arguments:");
+        for (String arg : positionalArgs) {
+            System.out.println(arg);
+        }
+    }
+
+    // Helper method: tokenize with support for quotes
+    private static List<String> tokenize(String input) {
+        List<String> tokens = new ArrayList<>();
+        Matcher m = Pattern.compile("\"([^\"]*)\"|(\\S+)").matcher(input);
+        while (m.find()) {
+            if (m.group(1) != null) {
+                tokens.add(m.group(1)); // quoted string without quotes
+            } else {
+                tokens.add(m.group(2)); // unquoted word
+            }
+        }
+        return tokens;
     }
 }
