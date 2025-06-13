@@ -1,160 +1,115 @@
-import java.util.*;
+import java.util.List;
 
-public class Job {
-    public String name;
-    public Map<String, String> attributes = new LinkedHashMap<>();
-    public List<String> dependencies = new ArrayList<>();
+public class DatabricksJobConfig {
+    public String jobName;
+    public String sparkVersion;
+    public String nodeType;
+    public int numWorkers;
+    public String jarPath;
+    public String mainClass;
+    public List<String> parameters;
+    public int maxRetries;
 
-    public Job(String name) {
-        this.name = name;
-    }
-
-    @Override
-    public String toString() {
-        return "Job: " + name + "\n  Attributes: " + attributes + "\n  Dependencies: " + dependencies;
-    }
-}
-
-import java.util.*;
-import java.util.regex.*;
-
-public class DependencyExtractor {
-
-    public static List<String> extractSuccessDependencies(String condition) {
-        List<String> dependencies = new ArrayList<>();
-        if (condition == null || condition.isEmpty()) return dependencies;
-
-        Matcher matcher = Pattern.compile("\\b(s|success)\\s*\\(\\s*([a-zA-Z0-9_\\.\\-]+)").matcher(condition);
-        while (matcher.find()) {
-            String job = matcher.group(2);
-            dependencies.add(job);
-        }
-        return dependencies;
+    public DatabricksJobConfig(String jobName, String sparkVersion, String nodeType, int numWorkers,
+                               String jarPath, String mainClass, List<String> parameters, int maxRetries) {
+        this.jobName = jobName;
+        this.sparkVersion = sparkVersion;
+        this.nodeType = nodeType;
+        this.numWorkers = numWorkers;
+        this.jarPath = jarPath;
+        this.mainClass = mainClass;
+        this.parameters = parameters;
+        this.maxRetries = maxRetries;
     }
 }
 
 
-import java.util.*;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.List;
 
-public class TopologicalSorter {
+public class DatabricksJarJobSubmitter {
 
-    public static LinkedHashMap<String, Job> sort(Map<String, Job> jobMap) {
-        LinkedHashMap<String, Job> sortedJobs = new LinkedHashMap<>();
-        Set<String> visited = new HashSet<>();
-        Set<String> visiting = new HashSet<>();
+    private static final String DATABRICKS_TOKEN = "dapiXXXXXXXXXXXXXXXXXXXXXXX";
+    private static final String DATABRICKS_HOST = "https://<your-workspace>.cloud.databricks.com";
 
-        for (String jobName : jobMap.keySet()) {
-            if (!visited.contains(jobName)) {
-                if (!dfs(jobName, jobMap, visited, visiting, sortedJobs)) {
-                    throw new RuntimeException("Cycle detected in job dependencies.");
-                }
-            }
+    public static void main(String[] args) throws Exception {
+        List<DatabricksJobConfig> jobs = Arrays.asList(
+            new DatabricksJobConfig(
+                "job-1",
+                "13.3.x-scala2.12",
+                "Standard_DS3_v2",
+                2,
+                "dbfs:/FileStore/my-jar/my-job1.jar",
+                "com.example.Job1Main",
+                Arrays.asList("argA", "argB"),
+                1
+            ),
+            new DatabricksJobConfig(
+                "job-2",
+                "13.3.x-scala2.12",
+                "Standard_DS3_v2",
+                3,
+                "dbfs:/FileStore/my-jar/my-job2.jar",
+                "com.example.Job2Main",
+                Arrays.asList("argX", "argY"),
+                2
+            )
+        );
+
+        for (DatabricksJobConfig job : jobs) {
+            submitJob(job);
         }
-
-        return sortedJobs;
     }
 
-    private static boolean dfs(String jobName, Map<String, Job> jobMap, Set<String> visited,
-                               Set<String> visiting, LinkedHashMap<String, Job> result) {
-        if (visiting.contains(jobName)) return false; // cycle
-        if (visited.contains(jobName)) return true;
+    private static void submitJob(DatabricksJobConfig job) throws Exception {
+        String paramArray = job.parameters.stream()
+            .map(p -> "\"" + p + "\"")
+            .reduce((p1, p2) -> p1 + ", " + p2)
+            .orElse("");
 
-        visiting.add(jobName);
-        Job job = jobMap.get(jobName);
-        if (job != null) {
-            for (String dep : job.dependencies) {
-                if (jobMap.containsKey(dep)) {
-                    if (!dfs(dep, jobMap, visited, visiting, result)) return false;
+        String jsonPayload = String.format("""
+            {
+              "name": "%s",
+              "new_cluster": {
+                "spark_version": "%s",
+                "node_type_id": "%s",
+                "num_workers": %d
+              },
+              "libraries": [
+                {
+                  "jar": "%s"
                 }
+              ],
+              "spark_jar_task": {
+                "main_class_name": "%s",
+                "parameters": [%s]
+              },
+              "max_retries": %d
             }
+            """, job.jobName, job.sparkVersion, job.nodeType, job.numWorkers,
+                job.jarPath, job.mainClass, paramArray, job.maxRetries);
+
+        URL url = new URL(DATABRICKS_HOST + "/api/2.1/jobs/create");
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Authorization", "Bearer " + DATABRICKS_TOKEN);
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setDoOutput(true);
+
+        try (OutputStream os = conn.getOutputStream()) {
+            byte[] input = jsonPayload.getBytes(StandardCharsets.UTF_8);
+            os.write(input, 0, input.length);
         }
 
-        visiting.remove(jobName);
-        visited.add(jobName);
-        result.put(jobName, job);
-        return true;
-    }
-}
-
-
-import java.io.*;
-import java.util.*;
-
-public class JilDependencyParser {
-
-    public static Map<String, Job> parseJobsWithDependencies(String filePath) throws IOException {
-        Map<String, Job> jobMap = new LinkedHashMap<>();
-
-        BufferedReader reader = new BufferedReader(new FileReader(filePath));
-        String line;
-        String currentJobName = null;
-        Job currentJob = null;
-        String currentKey = null;
-        StringBuilder valueBuilder = null;
-
-        while ((line = reader.readLine()) != null) {
-            line = line.trim();
-            if (line.isEmpty() || line.startsWith("#")) continue;
-
-            if (line.startsWith("insert_job:")) {
-                if (currentJob != null) {
-                    String cond = currentJob.attributes.get("condition");
-                    currentJob.dependencies = DependencyExtractor.extractSuccessDependencies(cond);
-                    jobMap.put(currentJobName, currentJob);
-                }
-
-                String[] parts = line.split("\\s+");
-                currentJobName = parts[1];
-                currentJob = new Job(currentJobName);
-                if (parts.length >= 4 && parts[2].equals("job_type:")) {
-                    currentJob.attributes.put("job_type", parts[3]);
-                }
-                currentKey = null;
-                valueBuilder = null;
-
-            } else if (line.contains(":")) {
-                if (currentKey != null && valueBuilder != null) {
-                    currentJob.attributes.put(currentKey, valueBuilder.toString().trim());
-                }
-                int idx = line.indexOf(':');
-                currentKey = line.substring(0, idx).trim();
-                String value = line.substring(idx + 1).trim();
-                valueBuilder = new StringBuilder(value);
-
-            } else if (currentKey != null && valueBuilder != null) {
-                valueBuilder.append("\n").append(line.trim());
-            }
-        }
-
-        if (currentJob != null) {
-            if (currentKey != null && valueBuilder != null) {
-                currentJob.attributes.put(currentKey, valueBuilder.toString().trim());
-            }
-            String cond = currentJob.attributes.get("condition");
-            currentJob.dependencies = DependencyExtractor.extractSuccessDependencies(cond);
-            jobMap.put(currentJobName, currentJob);
-        }
-
-        reader.close();
-        return jobMap;
-    }
-
-    public static void main(String[] args) {
-        String jilFile = "autosys_jobs.jil";
-
-        try {
-            Map<String, Job> parsedJobs = parseJobsWithDependencies(jilFile);
-            LinkedHashMap<String, Job> orderedJobs = TopologicalSorter.sort(parsedJobs);
-
-            for (Job job : orderedJobs.values()) {
-                System.out.println(job);
-                System.out.println();
-            }
-
-        } catch (IOException e) {
-            e.printStackTrace();
-        } catch (RuntimeException e) {
-            System.err.println("Error: " + e.getMessage());
+        int responseCode = conn.getResponseCode();
+        if (responseCode == 200 || responseCode == 201) {
+            System.out.printf("Job '%s' created successfully.%n", job.jobName);
+        } else {
+            System.err.printf("Failed to create job '%s'. Response code: %d%n", job.jobName, responseCode);
         }
     }
 }
