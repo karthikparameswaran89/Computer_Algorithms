@@ -1,113 +1,22 @@
-import java.util.*;
-import java.util.regex.*;
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.UserDefinedFunction
 
-public class SimulateUnixArgsWithQuotes {
-    public static void main(String[] args) {
-        // Command line with quoted argument
-        String commandLine = "./a.sh -s value -b value1 -c value3 asdf \"asdfg text\"";
+// Step 1: Target columns only — from level1_code to level20_code
+val levelCols = (1 to 20).map(i => s"level${i}_code")
 
-        // Use regex to handle quoted strings and unquoted tokens
-        List<String> tokens = tokenize(commandLine);
-
-        // Extract script name
-        String scriptName = tokens.get(0);
-
-        Map<String, String> flags = new LinkedHashMap<>();
-        List<String> positionalArgs = new ArrayList<>();
-
-        for (int i = 1; i < tokens.size(); i++) {
-            String current = tokens.get(i);
-            if (current.startsWith("-")) {
-                if (i + 1 < tokens.size() && !tokens.get(i + 1).startsWith("-")) {
-                    flags.put(current, tokens.get(i + 1));
-                    i++;
-                } else {
-                    flags.put(current, null);
-                }
-            } else {
-                positionalArgs.add(current);
-            }
-        }
-
-        System.out.println("Script name: " + scriptName);
-        System.out.println("\nFlags and values:");
-        for (Map.Entry<String, String> entry : flags.entrySet()) {
-            System.out.println(entry.getKey() + " = " + entry.getValue());
-        }
-
-        System.out.println("\nPositional arguments:");
-        for (String arg : positionalArgs) {
-            System.out.println(arg);
-        }
+// Step 2: UDF to find second-last different value
+val findSecondLastDifferent: UserDefinedFunction = udf((codes: Seq[String]) => {
+  if (codes == null || codes.size < 2) return null
+  for (i <- (codes.size - 1) to 1 by -1) {
+    if (codes(i) != codes(i - 1)) {
+      return codes(i - 1)
     }
+  }
+  null
+})
 
-    // Helper method: tokenize with support for quotes
-    private static List<String> tokenize(String input) {
-        List<String> tokens = new ArrayList<>();
-        Matcher m = Pattern.compile("\"([^\"]*)\"|(\\S+)").matcher(input);
-        while (m.find()) {
-            if (m.group(1) != null) {
-                tokens.add(m.group(1)); // quoted string without quotes
-            } else {
-                tokens.add(m.group(2)); // unquoted word
-            }
-        }
-        return tokens;
-    }
-}import java.util.*;
-import java.util.regex.*;
-
-public class SimulateUnixArgsWithQuotes {
-    public static void main(String[] args) {
-        // Command line with quoted argument
-        String commandLine = "./a.sh -s value -b value1 -c value3 asdf \"asdfg text\"";
-
-        // Use regex to handle quoted strings and unquoted tokens
-        List<String> tokens = tokenize(commandLine);
-
-        // Extract script name
-        String scriptName = tokens.get(0);
-
-        Map<String, String> flags = new LinkedHashMap<>();
-        List<String> positionalArgs = new ArrayList<>();
-
-        for (int i = 1; i < tokens.size(); i++) {
-            String current = tokens.get(i);
-            if (current.startsWith("-")) {
-                if (i + 1 < tokens.size() && !tokens.get(i + 1).startsWith("-")) {
-                    flags.put(current, tokens.get(i + 1));
-                    i++;
-                } else {
-                    flags.put(current, null);
-                }
-            } else {
-                positionalArgs.add(current);
-            }
-        }
-
-        System.out.println("Script name: " + scriptName);
-        System.out.println("\nFlags and values:");
-        for (Map.Entry<String, String> entry : flags.entrySet()) {
-            System.out.println(entry.getKey() + " = " + entry.getValue());
-        }
-
-        System.out.println("\nPositional arguments:");
-        for (String arg : positionalArgs) {
-            System.out.println(arg);
-        }
-    }
-
-    // Helper method: tokenize with support for quotes
-    private static List<String> tokenize(String input) {
-        List<String> tokens = new ArrayList<>();
-        Matcher m = Pattern.compile("\"([^\"]*)\"|(\\S+)").matcher(input);
-        while (m.find()) {
-            if (m.group(1) != null) {
-                tokens.add(m.group(1)); // quoted string without quotes
-            } else {
-                tokens.add(m.group(2)); // unquoted word
-            }
-        }
-        return tokens;
-    }
-}
+// Step 3: Apply to your DataFrame
+val dfWithDiff = df.withColumn(
+  "second_last_diff_value",
+  findSecondLastDifferent(array(levelCols.map(col): _*))
+)
