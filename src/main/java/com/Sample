@@ -1,22 +1,41 @@
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.expressions.UserDefinedFunction
 
-// Step 1: Target columns only — from level1_code to level20_code
-val levelCols = (1 to 20).map(i => s"level${i}_code")
+val spark = SparkSession.builder()
+  .appName("GroupBlockGenerator")
+  .master("local[*]") // Use your cluster settings here
+  .getOrCreate()
 
-// Step 2: UDF to find second-last different value
-val findSecondLastDifferent: UserDefinedFunction = udf((codes: Seq[String]) => {
-  if (codes == null || codes.size < 2) return null
-  for (i <- (codes.size - 1) to 1 by -1) {
-    if (codes(i) != codes(i - 1)) {
-      return codes(i - 1)
-    }
-  }
-  null
-})
+import spark.implicits._
 
-// Step 3: Apply to your DataFrame
-val dfWithDiff = df.withColumn(
-  "second_last_diff_value",
-  findSecondLastDifferent(array(levelCols.map(col): _*))
-)
+// Sample data
+val data = Seq(
+  ("A", 20220131, "GroupA"),
+  ("A", 20220228, "GroupA"),
+  ("A", 20220331, "GroupB"),
+  ("A", 20220430, "GroupA"),
+  ("A", 20220531, "GroupA"),
+  ("A", 20220630, "GroupA"),
+  ("A", 20220731, "GroupB"),
+  ("A", 20220831, "GroupB")
+).toDF("Driver", "Date", "Group")
+
+// Define window by Driver ordered by Date
+val windowSpec = Window.partitionBy("Driver").orderBy("Date")
+
+// Step 1: Lag Group to compare with previous
+val withLag = data.withColumn("PrevGroup", lag("Group", 1).over(windowSpec))
+
+// Step 2: Detect change in group
+val withChangeFlag = withLag.withColumn("ChangeFlag", when($"Group" =!= $"PrevGroup" || $"PrevGroup".isNull, 1).otherwise(0))
+
+// Step 3: Cumulative sum to get group block number
+val withGroupIndex = withChangeFlag.withColumn("GroupIndex", sum("ChangeFlag").over(windowSpec.rowsBetween(Window.unboundedPreceding, Window.currentRow)))
+
+// Step 4: Create final Group_Block name like group1, group2, etc.
+val result = withGroupIndex.withColumn("Group_Block", concat(lit("group"), $"GroupIndex".cast("string")))
+  .drop("PrevGroup", "ChangeFlag", "GroupIndex")
+
+// Show result
+result.show(false)
