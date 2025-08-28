@@ -1,5 +1,4 @@
 import pandas as pd
-from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
@@ -47,7 +46,7 @@ def list_tables(schema):
 
 def describe_table(schema, table_name):
     try:
-        desc = spark.sql(f"DESCRIBE DETAIL {schema}.{table_name}").collect()[0]
+        desc = spark.sql(f"DESCRIBE DETAIL `{schema}`.`{table_name}`").collect()[0]
         return desc
     except Exception as e:
         log_failure(f"DESCRIBE ERROR {schema}.{table_name}: {str(e)}")
@@ -136,11 +135,12 @@ if __name__ == "__main__":
     results = []
 
     schemas = list_schemas()
-    print(f"🔎 Found {len(schemas)} schemas.")
+    print(f"🔍 Found {len(schemas)} schemas.")
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        for schema in tqdm(schemas, desc="Schemas"):
+        for schema in schemas:
             try:
+                print(f"📁 Processing schema: {schema}")
                 tables = list_tables(schema)
                 for table in tables:
                     task = executor.submit(process_table, schema, table)
@@ -148,10 +148,17 @@ if __name__ == "__main__":
             except Exception as e:
                 log_failure(f"TABLE LIST ERROR {schema}: {str(e)}")
 
-        for future in tqdm(as_completed(all_tasks), total=len(all_tasks), desc="Processing Tables"):
+        total = len(all_tasks)
+        print(f"🔄 Processing {total} tables...")
+
+        completed = 0
+        for future in as_completed(all_tasks):
             result = future.result()
+            completed += 1
             if result:
                 results.append(result)
+            if completed % 100 == 0:
+                print(f"✅ Processed {completed}/{total} tables...")
 
     df = pd.DataFrame(results)
     df.to_csv("hive_metastore_table_inventory.csv", index=False)
