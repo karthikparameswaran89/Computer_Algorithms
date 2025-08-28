@@ -1,41 +1,197 @@
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.expressions.Window
-import org.apache.spark.sql.functions._
+import requests
+import json
+import pandas as pd
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from azure.storage.filedatalake import DataLakeServiceClient
+import threading
 
-val spark = SparkSession.builder()
-  .appName("GroupBlockGenerator")
-  .master("local[*]") // Use your cluster settings here
-  .getOrCreate()
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
 
-import spark.implicits._
+DATABRICKS_INSTANCE = "https://<your-databricks-instance>"  # e.g., https://adb-1234567890.10.azuredatabricks.net
+DATABRICKS_TOKEN = "<your-databricks-pat>"
+SQL_WAREHOUSE_ID = "<your-sql-warehouse-id>"
 
-// Sample data
-val data = Seq(
-  ("A", 20220131, "GroupA"),
-  ("A", 20220228, "GroupA"),
-  ("A", 20220331, "GroupB"),
-  ("A", 20220430, "GroupA"),
-  ("A", 20220531, "GroupA"),
-  ("A", 20220630, "GroupA"),
-  ("A", 20220731, "GroupB"),
-  ("A", 20220831, "GroupB")
-).toDF("Driver", "Date", "Group")
+AZURE_STORAGE_ACCOUNT_NAME = "<your-storage-account>"
+AZURE_STORAGE_ACCOUNT_KEY = "<your-storage-account-key>"
 
-// Define window by Driver ordered by Date
-val windowSpec = Window.partitionBy("Driver").orderBy("Date")
+ENABLE_FOLDER_SIZE = True
+ENABLE_DELTA_VERSION_CHECK = True
 
-// Step 1: Lag Group to compare with previous
-val withLag = data.withColumn("PrevGroup", lag("Group", 1).over(windowSpec))
+MAX_THREADS = 10
 
-// Step 2: Detect change in group
-val withChangeFlag = withLag.withColumn("ChangeFlag", when($"Group" =!= $"PrevGroup" || $"PrevGroup".isNull, 1).otherwise(0))
+# ----------------------------
+# LOGGING
+# ----------------------------
 
-// Step 3: Cumulative sum to get group block number
-val withGroupIndex = withChangeFlag.withColumn("GroupIndex", sum("ChangeFlag").over(windowSpec.rowsBetween(Window.unboundedPreceding, Window.currentRow)))
+log_lock = threading.Lock()
 
-// Step 4: Create final Group_Block name like group1, group2, etc.
-val result = withGroupIndex.withColumn("Group_Block", concat(lit("group"), $"GroupIndex".cast("string")))
-  .drop("PrevGroup", "ChangeFlag", "GroupIndex")
+def log_failure(message):
+    with log_lock:
+        with open("failures.log", "a") as f:
+            f.write(f"{message}\n")
 
-// Show result
-result.show(false)
+# ----------------------------
+# HELPERS
+# ----------------------------
+
+def databricks_api(path, method="GET", data=None):
+    headers = {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
+    url = f"{DATABRICKS_INSTANCE}{path}"
+    try:
+        if method == "GET":
+            response = requests.get(url, headers=headers)
+        else:
+            response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise Exception(f"API call failed at {path}: {str(e)}")
+
+def list_schemas():
+    resp = databricks_api("/api/2.1/unity-catalog/catalogs")
+    schemas = []
+    for catalog in resp["catalogs"]:
+        cat_name = catalog["name"]
+        dbs = databricks_api(f"/api/2.1/unity-catalog/catalogs/{cat_name}/schemas")
+        for db in dbs.get("schemas", []):
+            schemas.append((cat_name, db["name"]))
+    return schemas
+
+def list_tables(catalog, schema):
+    url = f"/api/2.1/unity-catalog/tables?catalog_name={catalog}&schema_name={schema}"
+    return databricks_api(url).get("tables", [])
+
+def describe_table_sql(catalog, schema, table):
+    try:
+        query = f"DESCRIBE DETAIL `{catalog}`.`{schema}`.`{table}`"
+        resp = databricks_api("/api/2.0/sql/statements", method="POST", data={
+            "statement": query,
+            "warehouse_id": SQL_WAREHOUSE_ID
+        })
+        statement_id = resp['statement_id']
+
+        # Polling
+        while True:
+            status = databricks_api(f"/api/2.0/sql/statements/{statement_id}")
+            if status['status'] == 'SUCCEEDED':
+                return status['result']['data_array'][0]
+            elif status['status'] in ['FAILED', 'CANCELLED']:
+                return None
+    except Exception as e:
+        log_failure(f"DESCRIBE ERROR {catalog}.{schema}.{table}: {str(e)}")
+        return None
+
+def get_folder_size(location):
+    try:
+        if not location.startswith("abfss://"):
+            return None
+        location = location.replace("abfss://", "")
+        container, rest = location.split("@")[0], location.split("@")[1]
+        path = rest.split("/", 1)[1]
+
+        service_client = DataLakeServiceClient(
+            account_url=f"https://{AZURE_STORAGE_ACCOUNT_NAME}.dfs.core.windows.net",
+            credential=AZURE_STORAGE_ACCOUNT_KEY
+        )
+        file_system_client = service_client.get_file_system_client(file_system=container)
+        directory_client = file_system_client.get_directory_client(path)
+
+        size = 0
+        paths = directory_client.get_paths(recursive=True)
+        for p in paths:
+            size += p.content_length if p.content_length else 0
+        return size
+    except Exception as e:
+        log_failure(f"SIZE ERROR for {location}: {str(e)}")
+        return None
+
+def get_delta_versions(location):
+    try:
+        query = f"DESCRIBE HISTORY delta.`{location}`"
+        resp = databricks_api("/api/2.0/sql/statements", method="POST", data={
+            "statement": query,
+            "warehouse_id": SQL_WAREHOUSE_ID
+        })
+        statement_id = resp['statement_id']
+
+        while True:
+            status = databricks_api(f"/api/2.0/sql/statements/{statement_id}")
+            if status['status'] == 'SUCCEEDED':
+                return len(status['result']['data_array'])
+            elif status['status'] in ['FAILED', 'CANCELLED']:
+                return None
+    except Exception as e:
+        log_failure(f"VERSION ERROR for {location}: {str(e)}")
+        return None
+
+# ----------------------------
+# TABLE PROCESSING FUNCTION
+# ----------------------------
+
+def process_table(catalog, schema, table_info):
+    table_name = table_info['name']
+    try:
+        desc = describe_table_sql(catalog, schema, table_name)
+        if not desc:
+            return None
+
+        location = desc[1]
+        table_type = desc[3]
+        num_rows = desc[6]
+        format_provider = desc[13]
+
+        size_bytes = get_folder_size(location) if ENABLE_FOLDER_SIZE else None
+        version_count = get_delta_versions(location) if ENABLE_DELTA_VERSION_CHECK and format_provider == 'delta' else None
+        has_multiple_versions = version_count and version_count > 1 if version_count else False
+
+        return {
+            "catalog": catalog,
+            "schema": schema,
+            "table_name": table_name,
+            "location": location,
+            "table_type": table_type,
+            "format": format_provider,
+            "row_count": num_rows,
+            "size_bytes": size_bytes,
+            "delta_versions": version_count,
+            "has_multiple_versions": has_multiple_versions
+        }
+    except Exception as e:
+        log_failure(f"GENERAL ERROR {catalog}.{schema}.{table_name}: {str(e)}")
+        return None
+
+# ----------------------------
+# MAIN
+# ----------------------------
+
+if __name__ == "__main__":
+    all_tasks = []
+    results = []
+
+    print("Fetching schemas...")
+    schemas = list_schemas()
+    print(f"Found {len(schemas)} schemas.")
+
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        for catalog, schema in tqdm(schemas, desc="Schemas"):
+            try:
+                tables = list_tables(catalog, schema)
+                for table in tables:
+                    task = executor.submit(process_table, catalog, schema, table)
+                    all_tasks.append(task)
+            except Exception as e:
+                log_failure(f"TABLE LIST ERROR {catalog}.{schema}: {str(e)}")
+
+        for future in tqdm(as_completed(all_tasks), total=len(all_tasks), desc="Processing Tables"):
+            result = future.result()
+            if result:
+                results.append(result)
+
+    # Export results
+    df = pd.DataFrame(results)
+    df.to_csv("databricks_table_inventory.csv", index=False)
+    print("✅ Inventory saved to databricks_table_inventory.csv")
+    print("❌ Failures logged to failures.log (if any)")
