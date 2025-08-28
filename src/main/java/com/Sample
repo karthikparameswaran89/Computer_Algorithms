@@ -1,26 +1,28 @@
-import requests
-import json
 import pandas as pd
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from azure.storage.filedatalake import DataLakeServiceClient
 import threading
+
+try:
+    from azure.storage.filedatalake import DataLakeServiceClient
+    AZURE_AVAILABLE = True
+except ImportError:
+    AZURE_AVAILABLE = False
+
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
 
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
 
-DATABRICKS_INSTANCE = "https://<your-databricks-instance>"  # e.g., https://adb-1234567890.10.azuredatabricks.net
-DATABRICKS_TOKEN = "<your-databricks-pat>"
-SQL_WAREHOUSE_ID = "<your-sql-warehouse-id>"
+ENABLE_FOLDER_SIZE = True         # Set False to skip size scan
+ENABLE_DELTA_VERSION_CHECK = True
+MAX_THREADS = 10
 
 AZURE_STORAGE_ACCOUNT_NAME = "<your-storage-account>"
-AZURE_STORAGE_ACCOUNT_KEY = "<your-storage-account-key>"
-
-ENABLE_FOLDER_SIZE = True
-ENABLE_DELTA_VERSION_CHECK = True
-
-MAX_THREADS = 10
+AZURE_STORAGE_ACCOUNT_KEY = "<your-storage-key>"
 
 # ----------------------------
 # LOGGING
@@ -37,57 +39,30 @@ def log_failure(message):
 # HELPERS
 # ----------------------------
 
-def databricks_api(path, method="GET", data=None):
-    headers = {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
-    url = f"{DATABRICKS_INSTANCE}{path}"
-    try:
-        if method == "GET":
-            response = requests.get(url, headers=headers)
-        else:
-            response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        raise Exception(f"API call failed at {path}: {str(e)}")
-
 def list_schemas():
-    resp = databricks_api("/api/2.1/unity-catalog/catalogs")
-    schemas = []
-    for catalog in resp["catalogs"]:
-        cat_name = catalog["name"]
-        dbs = databricks_api(f"/api/2.1/unity-catalog/catalogs/{cat_name}/schemas")
-        for db in dbs.get("schemas", []):
-            schemas.append((cat_name, db["name"]))
-    return schemas
+    return [db.name for db in spark.catalog.listDatabases()]
 
-def list_tables(catalog, schema):
-    url = f"/api/2.1/unity-catalog/tables?catalog_name={catalog}&schema_name={schema}"
-    return databricks_api(url).get("tables", [])
+def list_tables(schema):
+    return spark.catalog.listTables(schema)
 
-def describe_table_sql(catalog, schema, table):
+def describe_table(schema, table_name):
     try:
-        query = f"DESCRIBE DETAIL `{catalog}`.`{schema}`.`{table}`"
-        resp = databricks_api("/api/2.0/sql/statements", method="POST", data={
-            "statement": query,
-            "warehouse_id": SQL_WAREHOUSE_ID
-        })
-        statement_id = resp['statement_id']
-
-        # Polling
-        while True:
-            status = databricks_api(f"/api/2.0/sql/statements/{statement_id}")
-            if status['status'] == 'SUCCEEDED':
-                return status['result']['data_array'][0]
-            elif status['status'] in ['FAILED', 'CANCELLED']:
-                return None
+        desc = spark.sql(f"DESCRIBE DETAIL {schema}.{table_name}").collect()[0]
+        return desc
     except Exception as e:
-        log_failure(f"DESCRIBE ERROR {catalog}.{schema}.{table}: {str(e)}")
+        log_failure(f"DESCRIBE ERROR {schema}.{table_name}: {str(e)}")
         return None
 
 def get_folder_size(location):
     try:
         if not location.startswith("abfss://"):
+            log_failure(f"SKIPPED SIZE (non-ADLS): {location}")
             return None
+
+        if not AZURE_AVAILABLE:
+            log_failure(f"Azure SDK not available: {location}")
+            return None
+
         location = location.replace("abfss://", "")
         container, rest = location.split("@")[0], location.split("@")[1]
         path = rest.split("/", 1)[1]
@@ -96,7 +71,7 @@ def get_folder_size(location):
             account_url=f"https://{AZURE_STORAGE_ACCOUNT_NAME}.dfs.core.windows.net",
             credential=AZURE_STORAGE_ACCOUNT_KEY
         )
-        file_system_client = service_client.get_file_system_client(file_system=container)
+        file_system_client = service_client.get_file_system_client(container)
         directory_client = file_system_client.get_directory_client(path)
 
         size = 0
@@ -105,93 +80,81 @@ def get_folder_size(location):
             size += p.content_length if p.content_length else 0
         return size
     except Exception as e:
-        log_failure(f"SIZE ERROR for {location}: {str(e)}")
+        log_failure(f"SIZE ERROR {location}: {str(e)}")
         return None
 
 def get_delta_versions(location):
     try:
-        query = f"DESCRIBE HISTORY delta.`{location}`"
-        resp = databricks_api("/api/2.0/sql/statements", method="POST", data={
-            "statement": query,
-            "warehouse_id": SQL_WAREHOUSE_ID
-        })
-        statement_id = resp['statement_id']
-
-        while True:
-            status = databricks_api(f"/api/2.0/sql/statements/{statement_id}")
-            if status['status'] == 'SUCCEEDED':
-                return len(status['result']['data_array'])
-            elif status['status'] in ['FAILED', 'CANCELLED']:
-                return None
+        df = spark.sql(f"DESCRIBE HISTORY delta.`{location}`")
+        return df.count()
     except Exception as e:
-        log_failure(f"VERSION ERROR for {location}: {str(e)}")
+        log_failure(f"VERSION ERROR {location}: {str(e)}")
         return None
 
 # ----------------------------
-# TABLE PROCESSING FUNCTION
+# TABLE PROCESSING
 # ----------------------------
 
-def process_table(catalog, schema, table_info):
-    table_name = table_info['name']
+def process_table(schema, table_obj):
+    table_name = table_obj.name
     try:
-        desc = describe_table_sql(catalog, schema, table_name)
+        desc = describe_table(schema, table_name)
         if not desc:
             return None
 
-        location = desc[1]
-        table_type = desc[3]
-        num_rows = desc[6]
-        format_provider = desc[13]
+        location = desc['location']
+        table_type = desc['tableType']
+        format_provider = desc.get('format', {}).get('provider', 'UNKNOWN')
+        row_count = desc.get('numRows', None)
 
         size_bytes = get_folder_size(location) if ENABLE_FOLDER_SIZE else None
         version_count = get_delta_versions(location) if ENABLE_DELTA_VERSION_CHECK and format_provider == 'delta' else None
         has_multiple_versions = version_count and version_count > 1 if version_count else False
 
         return {
-            "catalog": catalog,
             "schema": schema,
             "table_name": table_name,
             "location": location,
             "table_type": table_type,
             "format": format_provider,
-            "row_count": num_rows,
+            "row_count": row_count,
             "size_bytes": size_bytes,
             "delta_versions": version_count,
             "has_multiple_versions": has_multiple_versions
         }
+
     except Exception as e:
-        log_failure(f"GENERAL ERROR {catalog}.{schema}.{table_name}: {str(e)}")
+        log_failure(f"GENERAL ERROR {schema}.{table_name}: {str(e)}")
         return None
 
 # ----------------------------
-# MAIN
+# MAIN EXECUTION
 # ----------------------------
 
 if __name__ == "__main__":
     all_tasks = []
     results = []
 
-    print("Fetching schemas...")
     schemas = list_schemas()
-    print(f"Found {len(schemas)} schemas.")
+    print(f"🔎 Found {len(schemas)} schemas.")
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        for catalog, schema in tqdm(schemas, desc="Schemas"):
+        for schema in tqdm(schemas, desc="Schemas"):
             try:
-                tables = list_tables(catalog, schema)
+                tables = list_tables(schema)
                 for table in tables:
-                    task = executor.submit(process_table, catalog, schema, table)
+                    task = executor.submit(process_table, schema, table)
                     all_tasks.append(task)
             except Exception as e:
-                log_failure(f"TABLE LIST ERROR {catalog}.{schema}: {str(e)}")
+                log_failure(f"TABLE LIST ERROR {schema}: {str(e)}")
 
         for future in tqdm(as_completed(all_tasks), total=len(all_tasks), desc="Processing Tables"):
             result = future.result()
             if result:
                 results.append(result)
 
-    # Export results
     df = pd.DataFrame(results)
-    df.to_csv("databricks_table_inventory.csv", index=False)
-    print("✅ Inventory saved to databricks_table_inventory.csv")
-    print("❌ Failures logged to failures.log (if any)")
+    df.to_csv("hive_metastore_table_inventory.csv", index=False)
+
+    print("✅ Report saved to hive_metastore_table_inventory.csv")
+    print("❌ Errors (if any) logged in failures.log")
