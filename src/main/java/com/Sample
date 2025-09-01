@@ -1,44 +1,63 @@
-import os
 import pandas as pd
-from delta.tables import DeltaTable
-from pyspark.sql import SparkSession
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configs
-INPUT_CSV = "/dbfs/tmp/metadata.csv"          # Input CSV with table names (and optionally locations)
-OUTPUT_CSV = "/dbfs/tmp/delta_table_sizes.csv"  # Output file
-MAX_WORKERS = 16                               # Tune this per cluster size
+from pyspark.sql import SparkSession
+
+# For recursive folder listing in DBFS
+from pyspark.dbutils import DBUtils
+import sys
 
 spark = SparkSession.builder.getOrCreate()
+dbutils = DBUtils(spark)
+
+# === Config ===
+INPUT_CSV = "/dbfs/tmp/metadata.csv"
+OUTPUT_CSV = "/dbfs/tmp/delta_table_sizes.csv"
+MAX_WORKERS = 16
+# =================
 
 def get_table_location(table_name: str) -> str:
-    """Gets the physical location of a Delta table"""
+    """Get Delta table physical location via DESCRIBE DETAIL"""
     try:
-        location = spark.sql(f"DESCRIBE DETAIL {table_name}").select("location").collect()[0][0]
+        df = spark.sql(f"DESCRIBE DETAIL {table_name}")
+        location = df.select("location").collect()[0][0]
         return location
     except Exception as e:
-        raise RuntimeError(f"Failed to get location for {table_name}: {e}")
+        raise RuntimeError(f"❌ Failed to get location for {table_name}: {e}")
+
+def list_all_files(dbfs_path: str):
+    """Recursively list all files under a DBFS path using dbutils"""
+    files = []
+    try:
+        for item in dbutils.fs.ls(dbfs_path):
+            if item.isDir():
+                files.extend(list_all_files(item.path))
+            else:
+                files.append(item)
+    except Exception as e:
+        print(f"⚠️ Error listing {dbfs_path}: {e}")
+    return files
 
 def get_folder_size(dbfs_path: str) -> int:
-    """Recursively compute size of all files under a DBFS path (in bytes)"""
-    local_path = "/dbfs" + dbfs_path.replace("dbfs:", "")
-    total_size = 0
-    for dirpath, _, filenames in os.walk(local_path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            try:
-                total_size += os.path.getsize(fp)
-            except Exception:
-                pass  # skip unreadable files
-    return total_size
+    """Calculate total size in bytes of all files under a DBFS folder"""
+    files = list_all_files(dbfs_path)
+    return sum(f.size for f in files)
 
-def process_table(table_name: str):
-    """Processes a single table to compute full storage size"""
+def process_table(row: dict):
+    """
+    Process a table row: get location (if missing), compute size.
+    Row keys: table, location
+    """
+    table_name = row.get("table")
+    location = row.get("location")
+
     try:
-        location = get_table_location(table_name)
+        if not location or pd.isna(location):
+            location = get_table_location(table_name)
+
         size_bytes = get_folder_size(location)
         size_gb = round(size_bytes / (1024 ** 3), 3)
-        print(f"✅ {table_name} → {size_gb} GB")
+
         return {
             "table": table_name,
             "location": location,
@@ -46,36 +65,45 @@ def process_table(table_name: str):
             "size_gb": size_gb,
             "error": None
         }
+
     except Exception as e:
-        print(f"❌ {table_name} → ERROR: {e}")
         return {
             "table": table_name,
-            "location": None,
+            "location": location or None,
             "size_bytes": -1,
             "size_gb": -1,
             "error": str(e)
         }
 
 def main():
-    # Load table list from CSV
     df = pd.read_csv(INPUT_CSV)
-    if "table" not in df.columns:
-        raise ValueError("Input CSV must have a 'table' column with full table names (e.g. hive_metastore.default.my_table)")
 
-    table_names = df["table"].dropna().unique().tolist()
+    # Ensure expected columns exist
+    if not {"table", "location"}.issubset(df.columns):
+        raise ValueError("CSV must contain 'table' and 'location' columns")
 
-    # Run in parallel
+    rows = df[["table", "location"]].dropna(subset=["table"]).to_dict(orient="records")
+
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_table, tbl): tbl for tbl in table_names}
-        for future in as_completed(futures):
-            results.append(future.result())
+        futures = {
+            executor.submit(process_table, row): row["table"]
+            for row in rows
+        }
 
-    # Write to CSV
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+
+            # Logging
+            if result["error"]:
+                print(f"❌ {result['table']} → ERROR: {result['error']}")
+            else:
+                print(f"✅ {result['table']} → {result['size_gb']} GB")
+
     df_out = pd.DataFrame(results)
     df_out.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n📁 Size report saved to: {OUTPUT_CSV}")
+    print(f"\n✅ Size report saved to: {OUTPUT_CSV}")
 
-# Run it
 if __name__ == "__main__":
     main()
