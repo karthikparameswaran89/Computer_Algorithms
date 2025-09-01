@@ -1,24 +1,21 @@
+from py4j.java_gateway import java_import
 from pyspark.sql import Row
 
-# ---- Config ----
-BATCH_SIZE = 1000        # how many rows per batch
-PARTITIONS_PER_BATCH = 50  # how many concurrent tasks allowed per batch
+# Import Hadoop classes
+java_import(spark._jvm, "org.apache.hadoop.fs.FileSystem")
+java_import(spark._jvm, "org.apache.hadoop.fs.Path")
 
-# ---- Recursive size function ----
+# Function to compute recursive size using Hadoop API
 def get_size(path: str) -> int:
-    total_size = 0
+    fs = spark._jvm.FileSystem.get(spark._jsc.hadoopConfiguration())
+    p = spark._jvm.Path(path)
     try:
-        files = dbutils.fs.ls(path)
-        for f in files:
-            if f.isDir():
-                total_size += get_size(f.path)  # recursion
-            else:
-                total_size += f.size
+        return fs.getContentSummary(p).getLength()
     except Exception as e:
         print(f"Error on {path}: {e}")
-    return total_size
+        return -1   # mark failed
 
-# ---- Partition processor ----
+# Partition-level processor
 def process_partition(rows_iter):
     results = []
     for row in rows_iter:
@@ -26,27 +23,16 @@ def process_partition(rows_iter):
         results.append(Row(table_name=row.table_name, size_bytes=size))
     return iter(results)
 
-# ---- Driver: batch loop ----
-rows = df.collect()   # careful: ensure row count is manageable (10k fine)
+# ---- DRIVER CODE ----
 
-results_all = []
+# control concurrency: each partition = one task
+PARTITIONS = 100   # tune this: fewer partitions = fewer concurrent file ops
 
-for i in range(0, len(rows), BATCH_SIZE):
-    batch = rows[i:i+BATCH_SIZE]
+# repartition so we don’t launch 10k tasks
+df_partitioned = df.repartition(PARTITIONS)
 
-    # convert this batch back to DF
-    batch_df = spark.createDataFrame(batch)
+# run distributed job
+result_df = df_partitioned.rdd.mapPartitions(process_partition).toDF()
 
-    # control #concurrent tasks
-    batch_df = batch_df.repartition(PARTITIONS_PER_BATCH)
-
-    # run distributed job for this batch
-    result_df = batch_df.rdd.mapPartitions(process_partition).toDF()
-
-    # collect or append to list
-    batch_results = result_df.collect()
-    results_all.extend(batch_results)
-
-# ---- Final results as DF ----
-final_df = spark.createDataFrame(results_all)
-final_df.show()
+# now you have (table_name, size_bytes)
+result_df.show(20, truncate=False)
