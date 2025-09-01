@@ -8,7 +8,7 @@ TENANT_ID = "your-tenant-id"
 CLIENT_ID = "your-client-id"
 CLIENT_SECRET = "your-client-secret"
 
-# Databricks connection details
+# Databricks workspace
 DATABRICKS_HOSTNAME = "your-databricks-instance.cloud.databricks.com"
 DATABRICKS_HTTP_PATH = "your-sql-warehouse-http-path"
 DATABRICKS_SCOPE = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"
@@ -41,56 +41,59 @@ def get_databricks_connection():
         access_token=token
     )
 
-def get_schemas(catalog="hive_metastore"):
-    with get_databricks_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(f"SHOW SCHEMAS IN `{catalog}`")
-        return [r[0] for r in cur.fetchall()]
+def get_schemas(cursor, catalog="hive_metastore"):
+    cursor.execute(f"SHOW SCHEMAS IN `{catalog}`")
+    return [r[0] for r in cursor.fetchall()]
 
-def get_tables_with_extended(catalog, schema):
-    query = f"SHOW TABLE EXTENDED IN `{catalog}`.`{schema}` LIKE '*'"
-    with get_databricks_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(query)
-        return cur.fetchall()
+def get_tables_with_extended(cursor, catalog, schema):
+    cursor.execute(f"SHOW TABLE EXTENDED IN `{catalog}`.`{schema}` LIKE '*'")
+    return cursor.fetchall()
 
 def parse_table_extended(row):
     # row: (database, tableName, isTemporary, detailed string)
-    catalog = None  # we'll set later if needed
     _, table_name, _, detail = row
-    fmt = None
-    tbl_type = None
+    table_format = None
+    table_type = None
     if detail:
-        fmt_match = re.search(r"Type: (\w+)", detail)
-        fmt = fmt_match.group(1) if fmt_match else None
-        provider_match = re.search(r"Provider: (\w+)", detail)
-        tbl_type = provider_match.group(1) if provider_match else None
-    return table_name, fmt, tbl_type
+        # Try to extract provider and type using regex
+        format_match = re.search(r"Provider: (\w+)", detail)
+        type_match = re.search(r"Type: (\w+)", detail)
+        table_format = format_match.group(1) if format_match else ""
+        table_type = type_match.group(1) if type_match else ""
+    return table_name, table_format, table_type
 
 def collect_metadata(catalog="hive_metastore"):
     records = []
-    schemas = get_schemas(catalog)
-    for schema in schemas:
-        rows = get_tables_with_extended(catalog, schema)
-        for row in rows:
-            table_name, tbl_format, tbl_type = parse_table_extended(row)
-            records.append({
-                "catalog": catalog,
-                "schema": schema,
-                "table_name": table_name,
-                "table_format": tbl_format or "",
-                "table_type": tbl_type or ""
-            })
+    with get_databricks_connection() as conn:
+        cursor = conn.cursor()
+        schemas = get_schemas(cursor, catalog)
+
+        for schema in schemas:
+            print(f"Scanning schema: {schema}")
+            try:
+                rows = get_tables_with_extended(cursor, catalog, schema)
+                for row in rows:
+                    table_name, fmt, ttype = parse_table_extended(row)
+                    records.append({
+                        "catalog": catalog,
+                        "schema": schema,
+                        "table_name": table_name,
+                        "table_format": fmt,
+                        "table_type": ttype
+                    })
+            except Exception as e:
+                print(f"  [!] Failed to scan schema {schema}: {e}")
+        cursor.close()
     return records
 
 def save_to_csv(records, output="metadata.csv"):
     df = pd.DataFrame(records, columns=METADATA_COLUMNS)
     df.to_csv(output, index=False)
-    print(f"Metadata saved: {output}")
+    print(f"✅ Metadata saved to: {output}")
     return df
 
 if __name__ == "__main__":
     catalog = "hive_metastore"
-    data = collect_metadata(catalog)
-    df = save_to_csv(data)
+    metadata = collect_metadata(catalog)
+    df = save_to_csv(metadata)
     print(df.head())
