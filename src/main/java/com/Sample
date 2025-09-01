@@ -1,38 +1,55 @@
-from py4j.java_gateway import java_import
 from pyspark.sql import Row
 
-# Import Hadoop classes
-java_import(spark._jvm, "org.apache.hadoop.fs.FileSystem")
-java_import(spark._jvm, "org.apache.hadoop.fs.Path")
+# Config
+PARTITIONS = 100  # throttle concurrency
 
-# Function to compute recursive size using Hadoop API
-def get_size(path: str) -> int:
-    fs = spark._jvm.FileSystem.get(spark._jsc.hadoopConfiguration())
-    p = spark._jvm.Path(path)
+# Helper function: compute full physical size using Hadoop
+def get_physical_size(path, hadoop_fs, jvm):
     try:
-        return fs.getContentSummary(p).getLength()
+        p = jvm.org.apache.hadoop.fs.Path(path)
+        return hadoop_fs.getContentSummary(p).getLength()
     except Exception as e:
-        print(f"Error on {path}: {e}")
-        return -1   # mark failed
+        print(f"Physical size error on {path}: {e}")
+        return -1
+
+# Helper function: compute active size using Delta metadata
+def get_active_size(table_path):
+    try:
+        active_files = spark.read.format("delta").load(table_path)._jdf.inputFiles()
+        total_size = 0
+        for f in active_files:
+            # use Hadoop FileSystem to get file size
+            jvm = spark._jvm
+            fs = jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+            total_size += fs.getContentSummary(jvm.org.apache.hadoop.fs.Path(f)).getLength()
+        return total_size
+    except Exception as e:
+        print(f"Active size error on {table_path}: {e}")
+        return -1
 
 # Partition-level processor
 def process_partition(rows_iter):
+    # Initialize Hadoop FileSystem inside executor
+    jvm = spark._jvm
+    hadoop_fs = jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+
     results = []
     for row in rows_iter:
-        size = get_size(row.storage_location)
-        results.append(Row(table_name=row.table_name, size_bytes=size))
+        physical_size = get_physical_size(row.storage_location, hadoop_fs, jvm)
+        active_size = get_active_size(row.storage_location)
+        results.append(Row(
+            table_name=row.table_name,
+            physical_size_bytes=physical_size,
+            active_size_bytes=active_size
+        ))
     return iter(results)
 
-# ---- DRIVER CODE ----
-
-# control concurrency: each partition = one task
-PARTITIONS = 100   # tune this: fewer partitions = fewer concurrent file ops
-
-# repartition so we don’t launch 10k tasks
+# --- DRIVER CODE ---
+# Repartition to limit concurrency
 df_partitioned = df.repartition(PARTITIONS)
 
-# run distributed job
+# Map partitions (parallel across cluster) and compute sizes
 result_df = df_partitioned.rdd.mapPartitions(process_partition).toDF()
 
-# now you have (table_name, size_bytes)
+# Show results
 result_df.show(20, truncate=False)
