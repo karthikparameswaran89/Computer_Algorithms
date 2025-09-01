@@ -1,99 +1,110 @@
-import re
-from msal import ConfidentialClientApplication
-from databricks import sql
 import pandas as pd
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Azure AD credentials
-TENANT_ID = "your-tenant-id"
-CLIENT_ID = "your-client-id"
-CLIENT_SECRET = "your-client-secret"
+# === CONFIGURATION ===
 
-# Databricks workspace
-DATABRICKS_HOSTNAME = "your-databricks-instance.cloud.databricks.com"
-DATABRICKS_HTTP_PATH = "your-sql-warehouse-http-path"
-DATABRICKS_SCOPE = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"
+METADATA_CSV = "metadata.csv"
+OUTPUT_CSV = "all_table_sizes.csv"
 
-# Metadata columns
-METADATA_COLUMNS = [
-    "catalog",
-    "schema",
-    "table_name",
-    "table_format",
-    "table_type"
-]
+# Azure storage account (used in SDK only)
+BLOB_ACCOUNT_URL = "https://<your-storage-account>.blob.core.windows.net"
 
-def get_azure_ad_token():
-    app = ConfidentialClientApplication(
-        CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-        client_credential=CLIENT_SECRET,
-    )
-    res = app.acquire_token_for_client(scopes=[DATABRICKS_SCOPE])
-    if "access_token" in res:
-        return res["access_token"]
-    raise Exception(f"Failed to acquire token: {res.get('error_description')}")
+# Max parallel workers
+MAX_WORKERS = 10
 
-def get_databricks_connection():
-    token = get_azure_ad_token()
-    return sql.connect(
-        server_hostname=DATABRICKS_HOSTNAME,
-        http_path=DATABRICKS_HTTP_PATH,
-        access_token=token
-    )
+# =======================
 
-def get_schemas(cursor, catalog="hive_metastore"):
-    cursor.execute(f"SHOW SCHEMAS IN `{catalog}`")
-    return [r[0] for r in cursor.fetchall()]
+def extract_container_and_prefix(table_path_url: str):
+    """
+    From: https://account.dfs.core.windows.net/container/path/to/table
+    → returns: container, path/to/table
+    """
+    parsed = urlparse(table_path_url)
+    path_parts = parsed.path.lstrip("/").split("/", 1)
+    if len(path_parts) < 2:
+        raise ValueError(f"Invalid path: {table_path_url}")
+    return path_parts[0], path_parts[1]
 
-def get_tables_with_extended(cursor, catalog, schema):
-    cursor.execute(f"SHOW TABLE EXTENDED IN `{catalog}`.`{schema}` LIKE '*'")
-    return cursor.fetchall()
+def list_blobs_and_size(blob_service_client, table_path, schema, table, table_type):
+    try:
+        if not table_path or not table_path.startswith("abfss://"):
+            raise ValueError("Missing or invalid location URI")
 
-def parse_table_extended(row):
-    # row: (database, tableName, isTemporary, detailed string)
-    _, table_name, _, detail = row
-    table_format = None
-    table_type = None
-    if detail:
-        # Try to extract provider and type using regex
-        format_match = re.search(r"Provider: (\w+)", detail)
-        type_match = re.search(r"Type: (\w+)", detail)
-        table_format = format_match.group(1) if format_match else ""
-        table_type = type_match.group(1) if type_match else ""
-    return table_name, table_format, table_type
+        # Convert abfss → https
+        https_url = table_path.replace("abfss://", "https://").replace("@", ".blob.core.windows.net/")
+        container, prefix = extract_container_and_prefix(https_url)
 
-def collect_metadata(catalog="hive_metastore"):
-    records = []
-    with get_databricks_connection() as conn:
-        cursor = conn.cursor()
-        schemas = get_schemas(cursor, catalog)
+        container_client = blob_service_client.get_container_client(container)
 
-        for schema in schemas:
-            print(f"Scanning schema: {schema}")
-            try:
-                rows = get_tables_with_extended(cursor, catalog, schema)
-                for row in rows:
-                    table_name, fmt, ttype = parse_table_extended(row)
-                    records.append({
-                        "catalog": catalog,
-                        "schema": schema,
-                        "table_name": table_name,
-                        "table_format": fmt,
-                        "table_type": ttype
-                    })
-            except Exception as e:
-                print(f"  [!] Failed to scan schema {schema}: {e}")
-        cursor.close()
-    return records
+        total_size = 0
+        for blob in container_client.walk_blobs(name_starts_with=prefix):
+            total_size += blob.size
 
-def save_to_csv(records, output="metadata.csv"):
-    df = pd.DataFrame(records, columns=METADATA_COLUMNS)
-    df.to_csv(output, index=False)
-    print(f"✅ Metadata saved to: {output}")
-    return df
+        print(f"✔ {schema}.{table} ({table_type}) — {round(total_size / (1024**2), 2)} MB")
+        return {
+            "schema": schema,
+            "table": table,
+            "table_type": table_type,
+            "table_path": table_path,
+            "size_in_bytes": total_size
+        }
+
+    except Exception as e:
+        print(f"✘ Failed to get size for {schema}.{table} ({table_type}): {e}")
+        return {
+            "schema": schema,
+            "table": table,
+            "table_type": table_type,
+            "table_path": table_path,
+            "size_in_bytes": -1,
+            "error": str(e)
+        }
+
+def main():
+    df = pd.read_csv(METADATA_CSV)
+
+    # Skip views
+    df = df[df["table_format"].str.lower() != "view"]
+    df = df[df["table_type"].str.upper() != "VIEW"]
+
+    # Separate external and managed tables (both allowed now)
+    relevant_tables = df[
+        (df["table_type"].str.upper() == "EXTERNAL") |
+        (df["table_type"].str.upper() == "MANAGED")
+    ].copy()
+
+    # Use existing location field
+    relevant_tables = relevant_tables[relevant_tables["location"].notnull()]
+    relevant_tables = relevant_tables[relevant_tables["location"].str.startswith("abfss://")]
+
+    # Set up Azure credentials
+    credential = DefaultAzureCredential()
+    blob_service_client = BlobServiceClient(account_url=BLOB_ACCOUNT_URL, credential=credential)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                list_blobs_and_size,
+                blob_service_client,
+                row["location"],
+                row["schema"],
+                row["table_name"],
+                row["table_type"]
+            ): (row["schema"], row["table_name"])
+            for _, row in relevant_tables.iterrows()
+        }
+
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    # Save results
+    df_out = pd.DataFrame(results)
+    df_out.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✅ Table size report saved to: {OUTPUT_CSV}")
 
 if __name__ == "__main__":
-    catalog = "hive_metastore"
-    metadata = collect_metadata(catalog)
-    df = save_to_csv(metadata)
-    print(df.head())
+    main()
