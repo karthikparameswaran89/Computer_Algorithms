@@ -1,23 +1,89 @@
-import msal
-import requests
+from msal import ConfidentialClientApplication
+from databricks import sql
 
-TENANT_ID = "<your-tenant-id>"
-CLIENT_ID = "<your-client-id>"
-CLIENT_SECRET = "<your-client-secret>"
-DATABRICKS_RESOURCE = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
+# Azure App Registration (Service Principal) credentials
+TENANT_ID = "your-tenant-id"
+CLIENT_ID = "your-client-id"
+CLIENT_SECRET = "your-client-secret"
 
-authority = f"https://login.microsoftonline.com/{TENANT_ID}"
-app = msal.ConfidentialClientApplication(
-    client_id=CLIENT_ID,
-    client_credential=CLIENT_SECRET,
-    authority=authority
-)
+# Databricks workspace details
+DATABRICKS_HOSTNAME = "your-databricks-instance.cloud.databricks.com"
+DATABRICKS_HTTP_PATH = "your-sql-warehouse-http-path"
 
-token_response = app.acquire_token_for_client(scopes=[f"{DATABRICKS_RESOURCE}/.default"])
+# Azure scope for Databricks
+DATABRICKS_SCOPE = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"
 
-access_token = token_response["access_token"]
+def get_azure_ad_token():
+    authority = f"https://login.microsoftonline.com/{TENANT_ID}"
+    app = ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=authority,
+        client_credential=CLIENT_SECRET,
+    )
+    result = app.acquire_token_for_client(scopes=[DATABRICKS_SCOPE])
+    if "access_token" in result:
+        return result["access_token"]
+    else:
+        raise Exception(f"Failed to acquire token: {result.get('error_description')}")
 
-headers = {"Authorization": f"Bearer {access_token}"}
-response = requests.get("https://<databricks-instance>/api/2.0/clusters/list", headers=headers)
+def get_databricks_connection():
+    token = get_azure_ad_token()
+    connection = sql.connect(
+        server_hostname=DATABRICKS_HOSTNAME,
+        http_path=DATABRICKS_HTTP_PATH,
+        access_token=token
+    )
+    return connection
 
-print(response.json())
+def list_schemas():
+    try:
+        with get_databricks_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SHOW SCHEMAS")
+            print("Schemas:")
+            for row in cursor.fetchall():
+                print(f"- {row[0]}")
+            cursor.close()
+    except Exception as e:
+        print(f"Error listing schemas: {e}")
+
+def list_tables(catalog: str, schema: str):
+    try:
+        with get_databricks_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SHOW TABLES IN `{catalog}`.`{schema}`")
+            print(f"Tables in {catalog}.{schema}:")
+            for row in cursor.fetchall():
+                print(f"- {row[1]}")  # row[1] is the table name
+            cursor.close()
+    except Exception as e:
+        print(f"Error listing tables: {e}")
+
+def describe_table_sql(catalog: str, schema: str, table: str):
+    try:
+        with get_databricks_connection() as conn:
+            cursor = conn.cursor()
+            full_table = f"`{catalog}`.`{schema}`.`{table}`"
+            cursor.execute(f"DESCRIBE TABLE EXTENDED {full_table}")
+            print(f"Description of {full_table}:")
+            for row in cursor.fetchall():
+                print(f"{row[0]}: {row[1]}")
+            cursor.close()
+    except Exception as e:
+        print(f"Error describing table: {e}")
+
+# Example usage
+if __name__ == "__main__":
+    # List all schemas
+    list_schemas()
+
+    # Example values - replace with actual values from your workspace
+    example_catalog = "hive_metastore"
+    example_schema = "default"
+    example_table = "your_table_name"
+
+    # List tables in a specific schema
+    list_tables(example_catalog, example_schema)
+
+    # Describe a specific table
+    describe_table_sql(example_catalog, example_schema, example_table)
