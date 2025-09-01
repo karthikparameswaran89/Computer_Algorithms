@@ -1,110 +1,110 @@
 import pandas as pd
 from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobServiceClient
+from azure.storage.filedatalake import DataLakeServiceClient
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIGURATION ===
 
-METADATA_CSV = "metadata.csv"
+METADATA_CSV = "metadata.csv"                      # Must contain: catalog, schema, table_name, table_type, table_format, location
 OUTPUT_CSV = "all_table_sizes.csv"
 
-# Azure storage account (used in SDK only)
-BLOB_ACCOUNT_URL = "https://<your-storage-account>.blob.core.windows.net"
-
-# Max parallel workers
-MAX_WORKERS = 10
+STORAGE_ACCOUNT_NAME = "<your-storage-account>"   # without https:// or .dfs.core.windows.net
+MAX_WORKERS = 20
 
 # =======================
 
-def extract_container_and_prefix(table_path_url: str):
+def extract_filesystem_and_path(abfss_url: str):
     """
-    From: https://account.dfs.core.windows.net/container/path/to/table
-    → returns: container, path/to/table
+    From abfss://<container>@<account>.dfs.core.windows.net/path/to/table
+    → returns: <container>, <path/to/table>
     """
-    parsed = urlparse(table_path_url)
-    path_parts = parsed.path.lstrip("/").split("/", 1)
-    if len(path_parts) < 2:
-        raise ValueError(f"Invalid path: {table_path_url}")
-    return path_parts[0], path_parts[1]
+    parsed = urlparse(abfss_url)
+    if not parsed.netloc or "@" not in parsed.netloc:
+        raise ValueError(f"Invalid abfss URL: {abfss_url}")
+    
+    container = parsed.netloc.split("@")[0]
+    path = parsed.path.lstrip("/")
+    return container, path
 
-def list_blobs_and_size(blob_service_client, table_path, schema, table, table_type):
+def list_datalake_size(datalake_service_client, abfss_url, catalog, schema, table, table_type, table_format):
     try:
-        if not table_path or not table_path.startswith("abfss://"):
-            raise ValueError("Missing or invalid location URI")
-
-        # Convert abfss → https
-        https_url = table_path.replace("abfss://", "https://").replace("@", ".blob.core.windows.net/")
-        container, prefix = extract_container_and_prefix(https_url)
-
-        container_client = blob_service_client.get_container_client(container)
+        filesystem_name, dir_path = extract_filesystem_and_path(abfss_url)
+        filesystem_client = datalake_service_client.get_file_system_client(filesystem=filesystem_name)
 
         total_size = 0
-        for blob in container_client.walk_blobs(name_starts_with=prefix):
-            total_size += blob.size
+        paths = filesystem_client.get_paths(path=dir_path, recursive=True)
+        for path in paths:
+            if not path.is_directory:
+                total_size += path.content_length
 
-        print(f"✔ {schema}.{table} ({table_type}) — {round(total_size / (1024**2), 2)} MB")
+        size_mb = round(total_size / (1024 ** 2), 2)
+        print(f"✔ {schema}.{table} [{table_type}, {table_format}] — {size_mb} MB")
+
         return {
+            "catalog": catalog,
             "schema": schema,
-            "table": table,
+            "table_name": table,
             "table_type": table_type,
-            "table_path": table_path,
-            "size_in_bytes": total_size
+            "table_format": table_format,
+            "location": abfss_url,
+            "size_in_bytes": total_size,
+            "size_in_mb": size_mb,
+            "error": None
         }
 
     except Exception as e:
-        print(f"✘ Failed to get size for {schema}.{table} ({table_type}): {e}")
+        print(f"✘ {schema}.{table} — ERROR: {e}")
         return {
+            "catalog": catalog,
             "schema": schema,
-            "table": table,
+            "table_name": table,
             "table_type": table_type,
-            "table_path": table_path,
+            "table_format": table_format,
+            "location": abfss_url,
             "size_in_bytes": -1,
+            "size_in_mb": -1,
             "error": str(e)
         }
 
 def main():
     df = pd.read_csv(METADATA_CSV)
 
-    # Skip views
-    df = df[df["table_format"].str.lower() != "view"]
-    df = df[df["table_type"].str.upper() != "VIEW"]
+    required_cols = {"catalog", "schema", "table_name", "table_type", "table_format", "location"}
+    if not required_cols.issubset(set(df.columns)):
+        raise ValueError(f"Input CSV must include columns: {', '.join(required_cols)}")
 
-    # Separate external and managed tables (both allowed now)
-    relevant_tables = df[
-        (df["table_type"].str.upper() == "EXTERNAL") |
-        (df["table_type"].str.upper() == "MANAGED")
-    ].copy()
+    # Filter out views (no data)
+    df = df[~df["table_type"].str.upper().isin(["VIEW"])]
+    df = df[df["location"].notnull() & df["location"].str.startswith("abfss://")]
 
-    # Use existing location field
-    relevant_tables = relevant_tables[relevant_tables["location"].notnull()]
-    relevant_tables = relevant_tables[relevant_tables["location"].str.startswith("abfss://")]
-
-    # Set up Azure credentials
+    # Set up DataLake client
     credential = DefaultAzureCredential()
-    blob_service_client = BlobServiceClient(account_url=BLOB_ACCOUNT_URL, credential=credential)
+    account_url = f"https://{STORAGE_ACCOUNT_NAME}.dfs.core.windows.net"
+    datalake_service_client = DataLakeServiceClient(account_url=account_url, credential=credential)
 
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
-                list_blobs_and_size,
-                blob_service_client,
+                list_datalake_size,
+                datalake_service_client,
                 row["location"],
+                row["catalog"],
                 row["schema"],
                 row["table_name"],
-                row["table_type"]
+                row["table_type"],
+                row["table_format"]
             ): (row["schema"], row["table_name"])
-            for _, row in relevant_tables.iterrows()
+            for _, row in df.iterrows()
         }
 
         for future in as_completed(futures):
             results.append(future.result())
 
-    # Save results
     df_out = pd.DataFrame(results)
     df_out.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n✅ Table size report saved to: {OUTPUT_CSV}")
+    print(f"\n✅ Saved table size report: {OUTPUT_CSV}")
 
 if __name__ == "__main__":
     main()
