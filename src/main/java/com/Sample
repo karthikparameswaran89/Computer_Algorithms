@@ -1,19 +1,110 @@
-# Create a temporary Delta table
-from pyspark.sql import SparkSession
-import uuid
+import pandas as pd
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-spark = SparkSession.builder.getOrCreate()
+# === CONFIGURATION ===
 
-temp_table_name = f"temp_test_table_{uuid.uuid4().hex[:8]}"
-temp_table_path = f"/tmp/{temp_table_name}"
+METADATA_CSV = "metadata.csv"
+OUTPUT_CSV = "all_table_sizes.csv"
 
-# Write a dummy table
-df = spark.range(1).toDF("id")
-df.write.format("delta").save(f"dbfs:{temp_table_path}")
+# Azure storage account (used in SDK only)
+BLOB_ACCOUNT_URL = "https://<your-storage-account>.blob.core.windows.net"
 
-# Get actual file path
-actual_path = spark.read.format("delta").load(f"dbfs:{temp_table_path}").inputFiles()[0]
-print("Actual backing path:", actual_path)
+# Max parallel workers
+MAX_WORKERS = 10
 
-# Cleanup
-dbutils.fs.rm(f"dbfs:{temp_table_path}", True)
+# =======================
+
+def extract_container_and_prefix(table_path_url: str):
+    """
+    From: https://account.dfs.core.windows.net/container/path/to/table
+    → returns: container, path/to/table
+    """
+    parsed = urlparse(table_path_url)
+    path_parts = parsed.path.lstrip("/").split("/", 1)
+    if len(path_parts) < 2:
+        raise ValueError(f"Invalid path: {table_path_url}")
+    return path_parts[0], path_parts[1]
+
+def list_blobs_and_size(blob_service_client, table_path, schema, table, table_type):
+    try:
+        if not table_path or not table_path.startswith("abfss://"):
+            raise ValueError("Missing or invalid location URI")
+
+        # Convert abfss → https
+        https_url = table_path.replace("abfss://", "https://").replace("@", ".blob.core.windows.net/")
+        container, prefix = extract_container_and_prefix(https_url)
+
+        container_client = blob_service_client.get_container_client(container)
+
+        total_size = 0
+        for blob in container_client.walk_blobs(name_starts_with=prefix):
+            total_size += blob.size
+
+        print(f"✔ {schema}.{table} ({table_type}) — {round(total_size / (1024**2), 2)} MB")
+        return {
+            "schema": schema,
+            "table": table,
+            "table_type": table_type,
+            "table_path": table_path,
+            "size_in_bytes": total_size
+        }
+
+    except Exception as e:
+        print(f"✘ Failed to get size for {schema}.{table} ({table_type}): {e}")
+        return {
+            "schema": schema,
+            "table": table,
+            "table_type": table_type,
+            "table_path": table_path,
+            "size_in_bytes": -1,
+            "error": str(e)
+        }
+
+def main():
+    df = pd.read_csv(METADATA_CSV)
+
+    # Skip views
+    df = df[df["table_format"].str.lower() != "view"]
+    df = df[df["table_type"].str.upper() != "VIEW"]
+
+    # Separate external and managed tables (both allowed now)
+    relevant_tables = df[
+        (df["table_type"].str.upper() == "EXTERNAL") |
+        (df["table_type"].str.upper() == "MANAGED")
+    ].copy()
+
+    # Use existing location field
+    relevant_tables = relevant_tables[relevant_tables["location"].notnull()]
+    relevant_tables = relevant_tables[relevant_tables["location"].str.startswith("abfss://")]
+
+    # Set up Azure credentials
+    credential = DefaultAzureCredential()
+    blob_service_client = BlobServiceClient(account_url=BLOB_ACCOUNT_URL, credential=credential)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                list_blobs_and_size,
+                blob_service_client,
+                row["location"],
+                row["schema"],
+                row["table_name"],
+                row["table_type"]
+            ): (row["schema"], row["table_name"])
+            for _, row in relevant_tables.iterrows()
+        }
+
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    # Save results
+    df_out = pd.DataFrame(results)
+    df_out.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✅ Table size report saved to: {OUTPUT_CSV}")
+
+if __name__ == "__main__":
+    main()
