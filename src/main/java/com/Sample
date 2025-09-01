@@ -1,110 +1,81 @@
+import os
 import pandas as pd
-from azure.identity import DefaultAzureCredential
-from azure.storage.filedatalake import DataLakeServiceClient
-from urllib.parse import urlparse
+from delta.tables import DeltaTable
+from pyspark.sql import SparkSession
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# === CONFIGURATION ===
+# Configs
+INPUT_CSV = "/dbfs/tmp/metadata.csv"          # Input CSV with table names (and optionally locations)
+OUTPUT_CSV = "/dbfs/tmp/delta_table_sizes.csv"  # Output file
+MAX_WORKERS = 16                               # Tune this per cluster size
 
-METADATA_CSV = "metadata.csv"                      # Must contain: catalog, schema, table_name, table_type, table_format, location
-OUTPUT_CSV = "all_table_sizes.csv"
+spark = SparkSession.builder.getOrCreate()
 
-STORAGE_ACCOUNT_NAME = "<your-storage-account>"   # without https:// or .dfs.core.windows.net
-MAX_WORKERS = 20
-
-# =======================
-
-def extract_filesystem_and_path(abfss_url: str):
-    """
-    From abfss://<container>@<account>.dfs.core.windows.net/path/to/table
-    → returns: <container>, <path/to/table>
-    """
-    parsed = urlparse(abfss_url)
-    if not parsed.netloc or "@" not in parsed.netloc:
-        raise ValueError(f"Invalid abfss URL: {abfss_url}")
-    
-    container = parsed.netloc.split("@")[0]
-    path = parsed.path.lstrip("/")
-    return container, path
-
-def list_datalake_size(datalake_service_client, abfss_url, catalog, schema, table, table_type, table_format):
+def get_table_location(table_name: str) -> str:
+    """Gets the physical location of a Delta table"""
     try:
-        filesystem_name, dir_path = extract_filesystem_and_path(abfss_url)
-        filesystem_client = datalake_service_client.get_file_system_client(filesystem=filesystem_name)
+        location = spark.sql(f"DESCRIBE DETAIL {table_name}").select("location").collect()[0][0]
+        return location
+    except Exception as e:
+        raise RuntimeError(f"Failed to get location for {table_name}: {e}")
 
-        total_size = 0
-        paths = filesystem_client.get_paths(path=dir_path, recursive=True)
-        for path in paths:
-            if not path.is_directory:
-                total_size += path.content_length
+def get_folder_size(dbfs_path: str) -> int:
+    """Recursively compute size of all files under a DBFS path (in bytes)"""
+    local_path = "/dbfs" + dbfs_path.replace("dbfs:", "")
+    total_size = 0
+    for dirpath, _, filenames in os.walk(local_path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            try:
+                total_size += os.path.getsize(fp)
+            except Exception:
+                pass  # skip unreadable files
+    return total_size
 
-        size_mb = round(total_size / (1024 ** 2), 2)
-        print(f"✔ {schema}.{table} [{table_type}, {table_format}] — {size_mb} MB")
-
+def process_table(table_name: str):
+    """Processes a single table to compute full storage size"""
+    try:
+        location = get_table_location(table_name)
+        size_bytes = get_folder_size(location)
+        size_gb = round(size_bytes / (1024 ** 3), 3)
+        print(f"✅ {table_name} → {size_gb} GB")
         return {
-            "catalog": catalog,
-            "schema": schema,
-            "table_name": table,
-            "table_type": table_type,
-            "table_format": table_format,
-            "location": abfss_url,
-            "size_in_bytes": total_size,
-            "size_in_mb": size_mb,
+            "table": table_name,
+            "location": location,
+            "size_bytes": size_bytes,
+            "size_gb": size_gb,
             "error": None
         }
-
     except Exception as e:
-        print(f"✘ {schema}.{table} — ERROR: {e}")
+        print(f"❌ {table_name} → ERROR: {e}")
         return {
-            "catalog": catalog,
-            "schema": schema,
-            "table_name": table,
-            "table_type": table_type,
-            "table_format": table_format,
-            "location": abfss_url,
-            "size_in_bytes": -1,
-            "size_in_mb": -1,
+            "table": table_name,
+            "location": None,
+            "size_bytes": -1,
+            "size_gb": -1,
             "error": str(e)
         }
 
 def main():
-    df = pd.read_csv(METADATA_CSV)
+    # Load table list from CSV
+    df = pd.read_csv(INPUT_CSV)
+    if "table" not in df.columns:
+        raise ValueError("Input CSV must have a 'table' column with full table names (e.g. hive_metastore.default.my_table)")
 
-    required_cols = {"catalog", "schema", "table_name", "table_type", "table_format", "location"}
-    if not required_cols.issubset(set(df.columns)):
-        raise ValueError(f"Input CSV must include columns: {', '.join(required_cols)}")
+    table_names = df["table"].dropna().unique().tolist()
 
-    # Filter out views (no data)
-    df = df[~df["table_type"].str.upper().isin(["VIEW"])]
-    df = df[df["location"].notnull() & df["location"].str.startswith("abfss://")]
-
-    # Set up DataLake client
-    credential = DefaultAzureCredential()
-    account_url = f"https://{STORAGE_ACCOUNT_NAME}.dfs.core.windows.net"
-    datalake_service_client = DataLakeServiceClient(account_url=account_url, credential=credential)
-
+    # Run in parallel
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                list_datalake_size,
-                datalake_service_client,
-                row["location"],
-                row["catalog"],
-                row["schema"],
-                row["table_name"],
-                row["table_type"],
-                row["table_format"]
-            ): (row["schema"], row["table_name"])
-            for _, row in df.iterrows()
-        }
-
+        futures = {executor.submit(process_table, tbl): tbl for tbl in table_names}
         for future in as_completed(futures):
             results.append(future.result())
 
+    # Write to CSV
     df_out = pd.DataFrame(results)
     df_out.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n✅ Saved table size report: {OUTPUT_CSV}")
+    print(f"\n📁 Size report saved to: {OUTPUT_CSV}")
 
+# Run it
 if __name__ == "__main__":
     main()
