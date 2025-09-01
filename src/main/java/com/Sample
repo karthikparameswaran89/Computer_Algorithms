@@ -1,167 +1,23 @@
-import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
+import msal
+import requests
 
-try:
-    from azure.storage.filedatalake import DataLakeServiceClient
-    AZURE_AVAILABLE = True
-except ImportError:
-    AZURE_AVAILABLE = False
+TENANT_ID = "<your-tenant-id>"
+CLIENT_ID = "<your-client-id>"
+CLIENT_SECRET = "<your-client-secret>"
+DATABRICKS_RESOURCE = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
-from pyspark.sql import SparkSession
+authority = f"https://login.microsoftonline.com/{TENANT_ID}"
+app = msal.ConfidentialClientApplication(
+    client_id=CLIENT_ID,
+    client_credential=CLIENT_SECRET,
+    authority=authority
+)
 
-spark = SparkSession.builder.getOrCreate()
+token_response = app.acquire_token_for_client(scopes=[f"{DATABRICKS_RESOURCE}/.default"])
 
-# ----------------------------
-# CONFIGURATION
-# ----------------------------
+access_token = token_response["access_token"]
 
-ENABLE_FOLDER_SIZE = True         # Set False to skip size scan
-ENABLE_DELTA_VERSION_CHECK = True
-MAX_THREADS = 10
+headers = {"Authorization": f"Bearer {access_token}"}
+response = requests.get("https://<databricks-instance>/api/2.0/clusters/list", headers=headers)
 
-AZURE_STORAGE_ACCOUNT_NAME = "<your-storage-account>"
-AZURE_STORAGE_ACCOUNT_KEY = "<your-storage-key>"
-
-# ----------------------------
-# LOGGING
-# ----------------------------
-
-log_lock = threading.Lock()
-
-def log_failure(message):
-    with log_lock:
-        with open("failures.log", "a") as f:
-            f.write(f"{message}\n")
-
-# ----------------------------
-# HELPERS
-# ----------------------------
-
-def list_schemas():
-    return [db.name for db in spark.catalog.listDatabases()]
-
-def list_tables(schema):
-    return spark.catalog.listTables(schema)
-
-def describe_table(schema, table_name):
-    try:
-        desc = spark.sql(f"DESCRIBE DETAIL `{schema}`.`{table_name}`").collect()[0]
-        return desc
-    except Exception as e:
-        log_failure(f"DESCRIBE ERROR {schema}.{table_name}: {str(e)}")
-        return None
-
-def get_folder_size(location):
-    try:
-        if not location.startswith("abfss://"):
-            log_failure(f"SKIPPED SIZE (non-ADLS): {location}")
-            return None
-
-        if not AZURE_AVAILABLE:
-            log_failure(f"Azure SDK not available: {location}")
-            return None
-
-        location = location.replace("abfss://", "")
-        container, rest = location.split("@")[0], location.split("@")[1]
-        path = rest.split("/", 1)[1]
-
-        service_client = DataLakeServiceClient(
-            account_url=f"https://{AZURE_STORAGE_ACCOUNT_NAME}.dfs.core.windows.net",
-            credential=AZURE_STORAGE_ACCOUNT_KEY
-        )
-        file_system_client = service_client.get_file_system_client(container)
-        directory_client = file_system_client.get_directory_client(path)
-
-        size = 0
-        paths = directory_client.get_paths(recursive=True)
-        for p in paths:
-            size += p.content_length if p.content_length else 0
-        return size
-    except Exception as e:
-        log_failure(f"SIZE ERROR {location}: {str(e)}")
-        return None
-
-def get_delta_versions(location):
-    try:
-        df = spark.sql(f"DESCRIBE HISTORY delta.`{location}`")
-        return df.count()
-    except Exception as e:
-        log_failure(f"VERSION ERROR {location}: {str(e)}")
-        return None
-
-# ----------------------------
-# TABLE PROCESSING
-# ----------------------------
-
-def process_table(schema, table_obj):
-    table_name = table_obj.name
-    try:
-        desc = describe_table(schema, table_name)
-        if not desc:
-            return None
-
-        location = desc['location']
-        table_type = desc['tableType']
-        format_provider = desc.get('format', {}).get('provider', 'UNKNOWN')
-        row_count = desc.get('numRows', None)
-
-        size_bytes = get_folder_size(location) if ENABLE_FOLDER_SIZE else None
-        version_count = get_delta_versions(location) if ENABLE_DELTA_VERSION_CHECK and format_provider == 'delta' else None
-        has_multiple_versions = version_count and version_count > 1 if version_count else False
-
-        return {
-            "schema": schema,
-            "table_name": table_name,
-            "location": location,
-            "table_type": table_type,
-            "format": format_provider,
-            "row_count": row_count,
-            "size_bytes": size_bytes,
-            "delta_versions": version_count,
-            "has_multiple_versions": has_multiple_versions
-        }
-
-    except Exception as e:
-        log_failure(f"GENERAL ERROR {schema}.{table_name}: {str(e)}")
-        return None
-
-# ----------------------------
-# MAIN EXECUTION
-# ----------------------------
-
-if __name__ == "__main__":
-    all_tasks = []
-    results = []
-
-    schemas = list_schemas()
-    print(f"🔍 Found {len(schemas)} schemas.")
-
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        for schema in schemas:
-            try:
-                print(f"📁 Processing schema: {schema}")
-                tables = list_tables(schema)
-                for table in tables:
-                    task = executor.submit(process_table, schema, table)
-                    all_tasks.append(task)
-            except Exception as e:
-                log_failure(f"TABLE LIST ERROR {schema}: {str(e)}")
-
-        total = len(all_tasks)
-        print(f"🔄 Processing {total} tables...")
-
-        completed = 0
-        for future in as_completed(all_tasks):
-            result = future.result()
-            completed += 1
-            if result:
-                results.append(result)
-            if completed % 100 == 0:
-                print(f"✅ Processed {completed}/{total} tables...")
-
-    df = pd.DataFrame(results)
-    df.to_csv("hive_metastore_table_inventory.csv", index=False)
-
-    print("✅ Report saved to hive_metastore_table_inventory.csv")
-    print("❌ Errors (if any) logged in failures.log")
+print(response.json())
