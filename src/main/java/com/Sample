@@ -1,89 +1,96 @@
+import re
 from msal import ConfidentialClientApplication
 from databricks import sql
+import pandas as pd
 
-# Azure App Registration (Service Principal) credentials
+# Azure AD credentials
 TENANT_ID = "your-tenant-id"
 CLIENT_ID = "your-client-id"
 CLIENT_SECRET = "your-client-secret"
 
-# Databricks workspace details
+# Databricks connection details
 DATABRICKS_HOSTNAME = "your-databricks-instance.cloud.databricks.com"
 DATABRICKS_HTTP_PATH = "your-sql-warehouse-http-path"
-
-# Azure scope for Databricks
 DATABRICKS_SCOPE = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"
 
+# Metadata columns
+METADATA_COLUMNS = [
+    "catalog",
+    "schema",
+    "table_name",
+    "table_format",
+    "table_type"
+]
+
 def get_azure_ad_token():
-    authority = f"https://login.microsoftonline.com/{TENANT_ID}"
     app = ConfidentialClientApplication(
         CLIENT_ID,
-        authority=authority,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
         client_credential=CLIENT_SECRET,
     )
-    result = app.acquire_token_for_client(scopes=[DATABRICKS_SCOPE])
-    if "access_token" in result:
-        return result["access_token"]
-    else:
-        raise Exception(f"Failed to acquire token: {result.get('error_description')}")
+    res = app.acquire_token_for_client(scopes=[DATABRICKS_SCOPE])
+    if "access_token" in res:
+        return res["access_token"]
+    raise Exception(f"Failed to acquire token: {res.get('error_description')}")
 
 def get_databricks_connection():
     token = get_azure_ad_token()
-    connection = sql.connect(
+    return sql.connect(
         server_hostname=DATABRICKS_HOSTNAME,
         http_path=DATABRICKS_HTTP_PATH,
         access_token=token
     )
-    return connection
 
-def list_schemas():
-    try:
-        with get_databricks_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SHOW SCHEMAS")
-            print("Schemas:")
-            for row in cursor.fetchall():
-                print(f"- {row[0]}")
-            cursor.close()
-    except Exception as e:
-        print(f"Error listing schemas: {e}")
+def get_schemas(catalog="hive_metastore"):
+    with get_databricks_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(f"SHOW SCHEMAS IN `{catalog}`")
+        return [r[0] for r in cur.fetchall()]
 
-def list_tables(catalog: str, schema: str):
-    try:
-        with get_databricks_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(f"SHOW TABLES IN `{catalog}`.`{schema}`")
-            print(f"Tables in {catalog}.{schema}:")
-            for row in cursor.fetchall():
-                print(f"- {row[1]}")  # row[1] is the table name
-            cursor.close()
-    except Exception as e:
-        print(f"Error listing tables: {e}")
+def get_tables_with_extended(catalog, schema):
+    query = f"SHOW TABLE EXTENDED IN `{catalog}`.`{schema}` LIKE '*'"
+    with get_databricks_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(query)
+        return cur.fetchall()
 
-def describe_table_sql(catalog: str, schema: str, table: str):
-    try:
-        with get_databricks_connection() as conn:
-            cursor = conn.cursor()
-            full_table = f"`{catalog}`.`{schema}`.`{table}`"
-            cursor.execute(f"DESCRIBE TABLE EXTENDED {full_table}")
-            print(f"Description of {full_table}:")
-            for row in cursor.fetchall():
-                print(f"{row[0]}: {row[1]}")
-            cursor.close()
-    except Exception as e:
-        print(f"Error describing table: {e}")
+def parse_table_extended(row):
+    # row: (database, tableName, isTemporary, detailed string)
+    catalog = None  # we'll set later if needed
+    _, table_name, _, detail = row
+    fmt = None
+    tbl_type = None
+    if detail:
+        fmt_match = re.search(r"Type: (\w+)", detail)
+        fmt = fmt_match.group(1) if fmt_match else None
+        provider_match = re.search(r"Provider: (\w+)", detail)
+        tbl_type = provider_match.group(1) if provider_match else None
+    return table_name, fmt, tbl_type
 
-# Example usage
+def collect_metadata(catalog="hive_metastore"):
+    records = []
+    schemas = get_schemas(catalog)
+    for schema in schemas:
+        rows = get_tables_with_extended(catalog, schema)
+        for row in rows:
+            table_name, tbl_format, tbl_type = parse_table_extended(row)
+            records.append({
+                "catalog": catalog,
+                "schema": schema,
+                "table_name": table_name,
+                "table_format": tbl_format or "",
+                "table_type": tbl_type or ""
+            })
+    return records
+
+def save_to_csv(records, output="metadata.csv"):
+    df = pd.DataFrame(records, columns=METADATA_COLUMNS)
+    df.to_csv(output, index=False)
+    print(f"Metadata saved: {output}")
+    return df
+
 if __name__ == "__main__":
-    # List all schemas
-    list_schemas()
-
-    # Example values - replace with actual values from your workspace
-    example_catalog = "hive_metastore"
-    example_schema = "default"
-    example_table = "your_table_name"
-
-    # List tables in a specific schema
-    list_tables(example_catalog, example_schema)
-
-    # Describe a specific table
-    describe_table_sql(example_catalog, example_schema, example_table)
+    catalog = "hive_metastore"
+    data = collect_metadata(catalog)
+    df = save_to_csv(data)
+    print(df.head())
