@@ -1,109 +1,52 @@
-import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql import Row
 
-from pyspark.sql import SparkSession
+# ---- Config ----
+BATCH_SIZE = 1000        # how many rows per batch
+PARTITIONS_PER_BATCH = 50  # how many concurrent tasks allowed per batch
 
-# For recursive folder listing in DBFS
-from pyspark.dbutils import DBUtils
-import sys
-
-spark = SparkSession.builder.getOrCreate()
-dbutils = DBUtils(spark)
-
-# === Config ===
-INPUT_CSV = "/dbfs/tmp/metadata.csv"
-OUTPUT_CSV = "/dbfs/tmp/delta_table_sizes.csv"
-MAX_WORKERS = 16
-# =================
-
-def get_table_location(table_name: str) -> str:
-    """Get Delta table physical location via DESCRIBE DETAIL"""
+# ---- Recursive size function ----
+def get_size(path: str) -> int:
+    total_size = 0
     try:
-        df = spark.sql(f"DESCRIBE DETAIL {table_name}")
-        location = df.select("location").collect()[0][0]
-        return location
-    except Exception as e:
-        raise RuntimeError(f"❌ Failed to get location for {table_name}: {e}")
-
-def list_all_files(dbfs_path: str):
-    """Recursively list all files under a DBFS path using dbutils"""
-    files = []
-    try:
-        for item in dbutils.fs.ls(dbfs_path):
-            if item.isDir():
-                files.extend(list_all_files(item.path))
+        files = dbutils.fs.ls(path)
+        for f in files:
+            if f.isDir():
+                total_size += get_size(f.path)  # recursion
             else:
-                files.append(item)
+                total_size += f.size
     except Exception as e:
-        print(f"⚠️ Error listing {dbfs_path}: {e}")
-    return files
+        print(f"Error on {path}: {e}")
+    return total_size
 
-def get_folder_size(dbfs_path: str) -> int:
-    """Calculate total size in bytes of all files under a DBFS folder"""
-    files = list_all_files(dbfs_path)
-    return sum(f.size for f in files)
-
-def process_table(row: dict):
-    """
-    Process a table row: get location (if missing), compute size.
-    Row keys: table, location
-    """
-    table_name = row.get("table")
-    location = row.get("location")
-
-    try:
-        if not location or pd.isna(location):
-            location = get_table_location(table_name)
-
-        size_bytes = get_folder_size(location)
-        size_gb = round(size_bytes / (1024 ** 3), 3)
-
-        return {
-            "table": table_name,
-            "location": location,
-            "size_bytes": size_bytes,
-            "size_gb": size_gb,
-            "error": None
-        }
-
-    except Exception as e:
-        return {
-            "table": table_name,
-            "location": location or None,
-            "size_bytes": -1,
-            "size_gb": -1,
-            "error": str(e)
-        }
-
-def main():
-    df = pd.read_csv(INPUT_CSV)
-
-    # Ensure expected columns exist
-    if not {"table", "location"}.issubset(df.columns):
-        raise ValueError("CSV must contain 'table' and 'location' columns")
-
-    rows = df[["table", "location"]].dropna(subset=["table"]).to_dict(orient="records")
-
+# ---- Partition processor ----
+def process_partition(rows_iter):
     results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(process_table, row): row["table"]
-            for row in rows
-        }
+    for row in rows_iter:
+        size = get_size(row.storage_location)
+        results.append(Row(table_name=row.table_name, size_bytes=size))
+    return iter(results)
 
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
+# ---- Driver: batch loop ----
+rows = df.collect()   # careful: ensure row count is manageable (10k fine)
 
-            # Logging
-            if result["error"]:
-                print(f"❌ {result['table']} → ERROR: {result['error']}")
-            else:
-                print(f"✅ {result['table']} → {result['size_gb']} GB")
+results_all = []
 
-    df_out = pd.DataFrame(results)
-    df_out.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n✅ Size report saved to: {OUTPUT_CSV}")
+for i in range(0, len(rows), BATCH_SIZE):
+    batch = rows[i:i+BATCH_SIZE]
 
-if __name__ == "__main__":
-    main()
+    # convert this batch back to DF
+    batch_df = spark.createDataFrame(batch)
+
+    # control #concurrent tasks
+    batch_df = batch_df.repartition(PARTITIONS_PER_BATCH)
+
+    # run distributed job for this batch
+    result_df = batch_df.rdd.mapPartitions(process_partition).toDF()
+
+    # collect or append to list
+    batch_results = result_df.collect()
+    results_all.extend(batch_results)
+
+# ---- Final results as DF ----
+final_df = spark.createDataFrame(results_all)
+final_df.show()
